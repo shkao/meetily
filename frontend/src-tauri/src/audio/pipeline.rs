@@ -24,10 +24,11 @@ use super::vad::{ContinuousVadProcessor};
 /// during continuous speech is tracked separately in #756.
 const VAD_REDEMPTION_TIME_MS: u32 = 500;
 
-/// Live transcription is delivered incrementally during uninterrupted speech.
-/// The target leaves room for a frame to arrive before the hard ceiling.
-const LIVE_SEGMENT_TARGET_MS: u32 = 20_000;
-const LIVE_SEGMENT_HARD_MAX_MS: u32 = 25_000;
+/// Live transcription is delivered incrementally during uninterrupted speech: once an active VAD segment
+/// holds LIVE_SEGMENT_MAX_MS of speech, it is cut at the quietest 100 ms after LIVE_SEGMENT_MIN_MS. Text
+/// then appears at most about 12 s after speech starts, plus ASR time, instead of waiting for a pause.
+const LIVE_SEGMENT_MIN_MS: u32 = 8_000;
+const LIVE_SEGMENT_MAX_MS: u32 = 12_000;
 
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
@@ -885,8 +886,8 @@ impl AudioPipeline {
                             // established 500ms redemption policy unchanged.
                             loop {
                                 match self.vad_processor.take_live_segment_if_ready(
-                                    LIVE_SEGMENT_TARGET_MS,
-                                    LIVE_SEGMENT_HARD_MAX_MS,
+                                    LIVE_SEGMENT_MIN_MS,
+                                    LIVE_SEGMENT_MAX_MS,
                                 ) {
                                     Ok(Some(segment)) => self.send_vad_segment(segment),
                                     Ok(None) => break,
@@ -1180,8 +1181,8 @@ mod policy_tests {
 
     #[test]
     fn live_segment_bounds_leave_no_unbounded_interval() {
-        assert_eq!(LIVE_SEGMENT_TARGET_MS, 20_000);
-        assert_eq!(LIVE_SEGMENT_HARD_MAX_MS, 25_000);
-        assert!(LIVE_SEGMENT_TARGET_MS <= LIVE_SEGMENT_HARD_MAX_MS);
+        assert_eq!(LIVE_SEGMENT_MIN_MS, 8_000);
+        assert_eq!(LIVE_SEGMENT_MAX_MS, 12_000);
+        assert!(LIVE_SEGMENT_MIN_MS <= LIVE_SEGMENT_MAX_MS);
     }
 }
