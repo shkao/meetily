@@ -4,7 +4,8 @@ import { Transcript, TranscriptSegmentData } from '@/types';
 import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
-import { useMemo } from 'react';
+import { SpeakerStatus, RenameSpeakerDialog } from './SpeakerLabels';
+import { useMemo, useState } from 'react';
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
@@ -61,8 +62,12 @@ export function TranscriptPanel({
       endTime: t.audio_end_time,
       text: t.text,
       confidence: t.confidence,
+      speaker: t.speaker,
     }));
   }, [transcripts, usePagination, segments]);
+
+  const [renamingSpeaker, setRenamingSpeaker] = useState<string | null>(null);
+  const hasSpeakers = convertedSegments.some(s => s.speaker);
 
   return (
     <div className="flex h-full min-w-0 w-full bg-white flex-col relative @container">
@@ -76,6 +81,13 @@ export function TranscriptPanel({
           meetingFolderPath={meetingFolderPath}
           onRefetchTranscripts={onRefetchTranscripts}
         />
+        {meetingId && !isRecording && convertedSegments.length > 0 && (
+          <SpeakerStatus
+            meetingId={meetingId}
+            hasSpeakers={hasSpeakers}
+            onRefetchTranscripts={onRefetchTranscripts}
+          />
+        )}
       </div>
 
       {/* Transcript content - use virtualized view for better performance */}
@@ -94,8 +106,18 @@ export function TranscriptPanel({
           totalCount={totalCount}
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
+          onSpeakerClick={meetingId ? setRenamingSpeaker : undefined}
         />
       </div>
+
+      {meetingId && (
+        <RenameSpeakerDialog
+          meetingId={meetingId}
+          speaker={renamingSpeaker}
+          onClose={() => setRenamingSpeaker(null)}
+          onRenamed={onRefetchTranscripts}
+        />
+      )}
 
       {/* Custom prompt input at bottom of transcript section */}
       {!isRecording && convertedSegments.length > 0 && (
