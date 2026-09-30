@@ -26,7 +26,8 @@ pub struct LiveLine {
 const SYSTEM_PROMPT: &str = "You answer questions about a meeting that is still in progress, using only its live \
 transcript. Each line starts with its time as [mm:ss]. Rules:
 - Answer briefly and directly. Use short bullet points for lists.
-- Cite the time of every fact you use, exactly as it appears, for example [03:15]. Never invent times.
+- End every bullet point and sentence with the [mm:ss] time of the line it comes from, exactly as it appears, for \
+example: \"Budget review moved to Friday [03:15]\". Never invent times.
 - The transcript has no speaker names. If the question asks who said something or what a named person said, say \
 that speaker names aren't available during the meeting, then answer what you can without attributing it.
 - If the transcript doesn't cover the question, say so. Don't guess.
@@ -177,9 +178,9 @@ mod tests {
         .await
         .unwrap();
         let lines: Vec<LiveLine> = rows.into_iter().map(|(start, text)| LiveLine { start, text }).collect();
-        for question in ["Catch me up", "What are the key decisions and action items so far?", "What did Priya say about the budget?"] {
+        for question in std::env::var("ASK_QUESTIONS").map(|q| q.split('|').map(String::from).collect::<Vec<_>>()).unwrap_or_else(|_| vec!["Catch me up".into(), "What are the key decisions and action items so far?".into(), "What did Priya say about the budget?".into()]) {
             let started = std::time::Instant::now();
-            let reply = answer(&pool, Some(env("ASK_APP_DIR").into()), question, &lines).await.unwrap();
+            let reply = answer(&pool, Some(env("ASK_APP_DIR").into()), &question, &lines).await.unwrap();
             println!("=== {question} ({:.1} s)\n{reply}\n", started.elapsed().as_secs_f64());
             assert!(!reply.is_empty());
         }
