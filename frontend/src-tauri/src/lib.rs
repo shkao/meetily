@@ -868,6 +868,7 @@ pub fn run() {
             api::api_test_custom_openai_connection,
             // Summary commands
             summary::commands::api_process_transcript,
+            summary::live_ask::ask_ai_live,
             summary::commands::api_get_summary,
             summary::commands::api_save_meeting_summary,
             summary::commands::api_get_meeting_summary_language,

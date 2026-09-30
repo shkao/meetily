@@ -20,17 +20,24 @@ import { TranscriptRecovery } from '@/components/TranscriptRecovery';
 import { indexedDBService } from '@/services/indexedDBService';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
+import { AskAiPanel } from '@/components/AskAiPanel';
+import { Sparkles } from 'lucide-react';
 
 export default function Home() {
   // Local page state (not moved to contexts)
   const [isRecording, setIsRecordingState] = useState(false);
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
+  const [isAskAiOpen, setIsAskAiOpen] = useState(false);
 
   // Use contexts for state management
   const { meetingTitle } = useTranscripts();
   const { transcriptModelConfig, selectedDevices } = useConfig();
   const recordingState = useRecordingState();
+
+  useEffect(() => {
+    if (!recordingState.isRecording) setIsAskAiOpen(false);
+  }, [recordingState.isRecording]);
 
   // Extract status from global state
   const { status, isStopping, isProcessing, isSaving } = recordingState;
@@ -213,19 +220,25 @@ export default function Home() {
           showModal={showModal}
         />
 
+        {/* Ask AI answers live only while recording; closing the recording clears them */}
+        {recordingState.isRecording && isAskAiOpen && (
+          <AskAiPanel onClose={() => setIsAskAiOpen(false)} />
+        )}
+
         {/* Recording controls - only show when permissions are granted or already recording and not showing status messages */}
         {(hasMicrophone || isRecording) &&
           status !== RecordingStatus.PROCESSING_TRANSCRIPTS &&
           status !== RecordingStatus.SAVING && (
-            <div className="fixed bottom-12 left-0 right-0 z-10">
+            <div className="fixed bottom-12 left-0 right-0 z-10 pointer-events-none">
               <div
                 className="flex justify-center pl-8 transition-[margin] duration-300"
                 style={{
-                  marginLeft: sidebarCollapsed ? '4rem' : '16rem'
+                  marginLeft: sidebarCollapsed ? '4rem' : '16rem',
+                  marginRight: recordingState.isRecording && isAskAiOpen ? '360px' : 0
                 }}
               >
-                <div className="w-2/3 max-w-[750px] flex justify-center">
-                  <div className="bg-white rounded-full shadow-lg flex items-center">
+                <div className="w-2/3 max-w-[750px] flex justify-center items-center">
+                  <div className="bg-white rounded-full shadow-lg flex items-center pointer-events-auto">
                     <RecordingControls
                       isRecording={recordingState.isRecording}
                       onRecordingStop={(callApi = true) => handleRecordingStop(callApi)}
@@ -242,6 +255,17 @@ export default function Home() {
                       meetingName={meetingTitle}
                     />
                   </div>
+                  {recordingState.isRecording && (
+                    <button
+                      type="button"
+                      onClick={() => setIsAskAiOpen(open => !open)}
+                      className={`ml-3 pointer-events-auto flex items-center gap-1 px-4 py-2.5 rounded-full shadow-lg text-sm ${isAskAiOpen ? 'bg-blue-100 text-blue-700' : 'bg-white text-gray-700 hover:bg-gray-100'}`}
+                      title="Ask AI about the meeting so far"
+                    >
+                      <Sparkles className="w-4 h-4" />
+                      Ask AI
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
