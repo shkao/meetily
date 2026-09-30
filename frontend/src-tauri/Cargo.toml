@@ -129,6 +129,8 @@ sysinfo = "0.32"
 
 lazy_static = { version = "1.4.0" }
 realfft = "3.4.0"
+rustfft = "6.4"  # complex FFT matching the diarization reference
+sha2 = "0.10"   # diarization model checksums
 regex = "1.11.0"
 ndarray = "0.16"
 bytes = { version = "1.9.0", features = ["serde"] }
