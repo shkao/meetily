@@ -2,11 +2,15 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { Loader2, Send, Sparkles, X } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 
 interface Message {
+  id: string;
   question: string;
+  /** Text streamed so far by local providers, replaced by `answer` when done */
+  partial?: string;
   answer?: string;
   error?: string;
 }
@@ -38,18 +42,35 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ request_id: string; text: string }>('ask-ai-token', (event) => {
+      const { request_id, text } = event.payload;
+      setMessages(prev => prev.map(m => (m.id === request_id ? { ...m, partial: (m.partial ?? '') + text } : m)));
+    }).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const ask = async (question: string) => {
     const q = question.trim();
     if (!q || busy) return;
     setInput('');
     setBusy(true);
-    setMessages(prev => [...prev, { question: q }]);
+    const id = crypto.randomUUID();
+    setMessages(prev => [...prev, { id, question: q }]);
     const lines = transcriptsRef.current.map(t => ({ start: t.audio_start_time ?? null, text: t.text }));
     try {
-      const answer = await invoke<string>('ask_ai_live', { question: q, lines });
-      setMessages(prev => prev.map((m, i) => (i === prev.length - 1 ? { ...m, answer } : m)));
+      const answer = await invoke<string>('ask_ai_live', { requestId: id, question: q, lines });
+      setMessages(prev => prev.map(m => (m.id === id ? { ...m, answer } : m)));
     } catch (e) {
-      setMessages(prev => prev.map((m, i) => (i === prev.length - 1 ? { ...m, error: String(e) } : m)));
+      setMessages(prev => prev.map(m => (m.id === id ? { ...m, error: String(e) } : m)));
     } finally {
       setBusy(false);
     }
@@ -112,16 +133,19 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
             Speaker names aren't available until after the meeting.
           </p>
         )}
-        {messages.map((m, i) => (
-          <div key={i} className="space-y-1">
+        {messages.map(m => (
+          <div key={m.id} className="space-y-1">
             <div className="font-medium text-gray-800">{m.question}</div>
             {m.answer !== undefined && (
               <div className="text-gray-700 whitespace-pre-wrap leading-relaxed">{renderAnswer(m.answer)}</div>
             )}
             {m.error && <div className="text-red-600">{m.error}</div>}
+            {m.answer === undefined && !m.error && m.partial && (
+              <div className="text-gray-700 whitespace-pre-wrap leading-relaxed">{renderAnswer(m.partial)}</div>
+            )}
             {m.answer === undefined && !m.error && (
               <div className="flex items-center gap-2 text-gray-400">
-                <Loader2 className="w-3 h-3 animate-spin" /> Thinking...
+                <Loader2 className="w-3 h-3 animate-spin" /> {m.partial ? 'Writing...' : 'Thinking...'}
               </div>
             )}
           </div>

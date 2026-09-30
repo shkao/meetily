@@ -289,6 +289,7 @@ pub(crate) async fn generate_summary(
             system_prompt,
             user_prompt,
             cancellation_token,
+            None,
         )
         .await
         .map(|content| LlmCompletion {
@@ -529,6 +530,17 @@ fn llm_http_failure_log_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_text_from_sse_delta_lines() {
+        assert_eq!(
+            sse_delta_text(r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#).as_deref(),
+            Some("Hel")
+        );
+        assert_eq!(sse_delta_text(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#), None);
+        assert_eq!(sse_delta_text("data: [DONE]"), None);
+        assert_eq!(sse_delta_text(": keep-alive"), None);
+    }
+
     use super::*;
     use serde_json::json;
     use std::{cell::Cell, task::Poll};
@@ -979,6 +991,94 @@ mod tests {
 }
 
 /// Helper function to get provider name for logging
+/// Like `generate_summary`, but sends text to `on_token` as it is generated for the local providers (built-in
+/// model and Ollama), where answers take long enough to need it. Other providers answer in one piece.
+/// The returned completion is the full text either way.
+pub(crate) async fn generate_streaming(
+    client: &Client,
+    provider: &LLMProvider,
+    model_name: &str,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    ollama_endpoint: Option<&str>,
+    custom_openai_endpoint: Option<&str>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    app_data_dir: Option<&PathBuf>,
+    on_token: &(dyn Fn(&str) + Send + Sync),
+) -> Result<LlmCompletion, String> {
+    match provider {
+        LLMProvider::BuiltInAI => {
+            let app_data_dir = app_data_dir
+                .ok_or_else(|| "app_data_dir is required for BuiltInAI provider".to_string())?;
+            crate::summary::summary_engine::generate_with_builtin(
+                app_data_dir,
+                model_name,
+                system_prompt,
+                user_prompt,
+                None,
+                Some(on_token),
+            )
+            .await
+            .map(|content| LlmCompletion { content, reasoning_stripped: false })
+            .map_err(|e| e.to_string())
+        }
+        LLMProvider::Ollama => {
+            let host = ollama_endpoint.unwrap_or("http://localhost:11434");
+            let mut body = build_openai_compat_chat_body(
+                provider, model_name, system_prompt, user_prompt, max_tokens, temperature, top_p,
+            );
+            body["stream"] = serde_json::Value::Bool(true);
+            let response = client
+                .post(format!("{}/v1/chat/completions", host))
+                .json(&body)
+                .timeout(REQUEST_TIMEOUT_DURATION)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to send request to LLM: {}", e))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!("LLM request failed with status {}: {}", status, text));
+            }
+            let mut content = String::new();
+            let mut pending = String::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+                let chunk = chunk.map_err(|e| format!("LLM stream failed: {}", e))?;
+                pending.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(newline) = pending.find('\n') {
+                    let line = pending[..newline].trim().to_string();
+                    pending.drain(..=newline);
+                    if let Some(text) = sse_delta_text(&line) {
+                        on_token(&text);
+                        content.push_str(&text);
+                    }
+                }
+            }
+            Ok(LlmCompletion { content, reasoning_stripped: false })
+        }
+        _ => generate_summary(
+            client, provider, model_name, api_key, system_prompt, user_prompt, ollama_endpoint,
+            custom_openai_endpoint, max_tokens, temperature, top_p, app_data_dir, None,
+        )
+        .await,
+    }
+}
+
+/// Text in one OpenAI-compatible server-sent event line (`data: {...choices[0].delta.content...}`).
+fn sse_delta_text(line: &str) -> Option<String> {
+    let data = line.strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return None;
+    }
+    let event: serde_json::Value = serde_json::from_str(data).ok()?;
+    let text = event["choices"][0]["delta"]["content"].as_str()?;
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 fn provider_name(provider: &LLMProvider) -> &str {
     match provider {
         LLMProvider::OpenAI => "OpenAI",

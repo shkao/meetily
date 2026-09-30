@@ -36,6 +36,8 @@ enum Request {
         repeat_penalty: Option<f32>,
         penalty_last_n: Option<i32>,
         stop_tokens: Option<Vec<String>>,
+        /// Send `token` lines while generating, before the final `response`
+        stream: Option<bool>,
     },
     Ping,
     Shutdown,
@@ -44,6 +46,8 @@ enum Request {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
+    /// Streamed text, sent only for requests with `stream: true`
+    Token { text: String },
     Response { text: String, error: Option<String> },
     Pong,
     Goodbye,
@@ -351,6 +355,7 @@ impl ModelState {
         max_tokens: i32,
         sampling: SamplingConfig,
         stop_tokens: Vec<String>,
+        on_token: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let start_time = Instant::now();
         let model = self.model.as_ref().context("Model not loaded")?;
@@ -446,6 +451,7 @@ impl ModelState {
             ])
         };
         let mut sampler = pin!(sampler);
+        let mut emitted = 0usize; // bytes of `output` already streamed
 
         loop {
             // Check if we've generated enough tokens
@@ -500,6 +506,11 @@ impl ModelState {
             if should_stop {
                 break;
             }
+            let safe_end = streamable_end(&output, &stop_tokens);
+            if safe_end > emitted {
+                on_token(&output[emitted..safe_end]);
+                emitted = safe_end;
+            }
 
             batch.clear();
             batch
@@ -543,6 +554,19 @@ fn send_response(response: &Response) -> Result<()> {
     println!("{}", json);
     io::stdout().flush()?;
     Ok(())
+}
+
+/// End of the text that can be streamed: holds back a tail that could still grow into a stop token.
+fn streamable_end(output: &str, stop_tokens: &[String]) -> usize {
+    let mut end = output.len();
+    for stop in stop_tokens {
+        for (i, _) in stop.char_indices().skip(1) {
+            if output.ends_with(&stop[..i]) {
+                end = end.min(output.len() - i);
+            }
+        }
+    }
+    end
 }
 
 fn main() -> Result<()> {
@@ -600,6 +624,7 @@ fn main() -> Result<()> {
                         repeat_penalty,
                         penalty_last_n,
                         stop_tokens,
+                        stream,
                     }) => {
                         let max_tokens = max_tokens.unwrap_or(512);
                         let context_size = context_size.unwrap_or(2048);
@@ -628,11 +653,18 @@ fn main() -> Result<()> {
                         }
 
                         // Generate response with sampling parameters
+                        let stream = stream.unwrap_or(false);
+                        let mut send_token = |text: &str| {
+                            if stream {
+                                let _ = send_response(&Response::Token { text: text.to_string() });
+                            }
+                        };
                         match state.generate(
                             prompt,
                             max_tokens,
                             sampling,
                             stop_tokens,
+                            &mut send_token,
                         ) {
                             Ok(text) => {
                                 send_response(&Response::Response { text, error: None })?;
@@ -746,5 +778,15 @@ mod tests {
         assert_eq!(sampling.repeat_penalty, 1.05);
         assert_eq!(sampling.penalty_last_n, 256);
         assert!(sampling.uses_penalties());
+    }
+
+    #[test]
+    fn streamable_end_holds_back_partial_stop_tokens() {
+        let stops = vec!["<end_of_turn>".to_string()];
+        assert_eq!(streamable_end("hello", &stops), 5);
+        assert_eq!(streamable_end("hello <end", &stops), 6);
+        assert_eq!(streamable_end("hello <", &stops), 6);
+        assert_eq!(streamable_end("a < b", &stops), 5);
+        assert_eq!(streamable_end("héllo", &[]), "héllo".len());
     }
 }

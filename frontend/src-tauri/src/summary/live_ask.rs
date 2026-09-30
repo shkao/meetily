@@ -7,13 +7,13 @@
 //! those notes. Live transcription is unlabelled, so questions about who said what get a plain "can't tell".
 
 use crate::database::repositories::setting::SettingsRepository;
-use crate::summary::llm_client::generate_summary;
+use crate::summary::llm_client::{generate_streaming, generate_summary};
 use crate::summary::processor::{chunk_text, clean_llm_markdown_detailed, rough_token_count};
 use crate::summary::service::{LlmSettings, SummaryService};
 use log::info;
 use reqwest::Client;
-use serde::Deserialize;
-use tauri::{AppHandle, Manager, Runtime};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// One live transcript segment as the panel holds it.
 #[derive(Debug, Deserialize)]
@@ -86,15 +86,27 @@ async fn complete(
     Ok(clean_llm_markdown_detailed(&completion.content).markdown.trim().to_string())
 }
 
-/// Answers a question from the live transcript with the summary provider.
+/// Answer text as it is generated, emitted as `ask-ai-token`.
+#[derive(Clone, Serialize)]
+struct AnswerToken {
+    request_id: String,
+    text: String,
+}
+
+/// Answers a question from the live transcript with the summary provider. Local providers stream the answer as
+/// `ask-ai-token` events; the returned text is the final, cleaned answer.
 #[tauri::command]
 pub async fn ask_ai_live<R: Runtime>(
     app: AppHandle<R>,
+    request_id: String,
     question: String,
     lines: Vec<LiveLine>,
 ) -> Result<String, String> {
     let pool = app.state::<crate::state::AppState>().db_manager.pool().clone();
-    answer(&pool, app.path().app_data_dir().ok(), &question, &lines).await
+    let on_token = |text: &str| {
+        let _ = app.emit("ask-ai-token", AnswerToken { request_id: request_id.clone(), text: text.to_string() });
+    };
+    answer(&pool, app.path().app_data_dir().ok(), &question, &lines, &on_token).await
 }
 
 async fn answer(
@@ -102,6 +114,7 @@ async fn answer(
     app_data_dir: Option<std::path::PathBuf>,
     question: &str,
     lines: &[LiveLine],
+    on_token: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<String, String> {
     let question = question.trim();
     if question.is_empty() {
@@ -139,7 +152,23 @@ async fn answer(
         notes.join("\n")
     };
 
-    complete(&client, &settings, &config.model, app_data_dir.as_ref(), SYSTEM_PROMPT, &question_prompt(&context, question)).await
+    let completion = generate_streaming(
+        &client,
+        &settings.provider,
+        &config.model,
+        &settings.api_key,
+        SYSTEM_PROMPT,
+        &question_prompt(&context, question),
+        settings.ollama_endpoint.as_deref(),
+        settings.custom_openai_endpoint.as_deref(),
+        settings.custom_openai_max_tokens,
+        settings.custom_openai_temperature,
+        settings.custom_openai_top_p,
+        app_data_dir.as_ref(),
+        on_token,
+    )
+    .await?;
+    Ok(clean_llm_markdown_detailed(&completion.content).markdown.trim().to_string())
 }
 
 #[cfg(test)]
@@ -180,8 +209,19 @@ mod tests {
         let lines: Vec<LiveLine> = rows.into_iter().map(|(start, text)| LiveLine { start, text }).collect();
         for question in std::env::var("ASK_QUESTIONS").map(|q| q.split('|').map(String::from).collect::<Vec<_>>()).unwrap_or_else(|_| vec!["Catch me up".into(), "What are the key decisions and action items so far?".into(), "What did Priya say about the budget?".into()]) {
             let started = std::time::Instant::now();
-            let reply = answer(&pool, Some(env("ASK_APP_DIR").into()), &question, &lines).await.unwrap();
-            println!("=== {question} ({:.1} s)\n{reply}\n", started.elapsed().as_secs_f64());
+            let first_token = std::sync::Mutex::new(None::<f64>);
+            let streamed = std::sync::Mutex::new(String::new());
+            let on_token = |text: &str| {
+                first_token.lock().unwrap().get_or_insert(started.elapsed().as_secs_f64());
+                streamed.lock().unwrap().push_str(text);
+            };
+            let reply = answer(&pool, Some(env("ASK_APP_DIR").into()), &question, &lines, &on_token).await.unwrap();
+            println!(
+                "=== {question} ({:.1} s, first text at {:?} s, {} chars streamed)\n{reply}\n",
+                started.elapsed().as_secs_f64(),
+                first_token.lock().unwrap().map(|t| (t * 10.0).round() / 10.0),
+                streamed.lock().unwrap().len()
+            );
             assert!(!reply.is_empty());
         }
     }
