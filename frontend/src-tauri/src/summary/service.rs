@@ -482,14 +482,8 @@ impl SummaryService {
         // Get app data directory for BuiltInAI provider
         let app_data_dir = _app.path().app_data_dir().ok();
 
-        // Name speakers from the saved recording; live transcription stays unlabelled.
-        let text = crate::diarization::transcript_for_summary(
-            &pool,
-            app_data_dir.as_deref(),
-            &meeting_id,
-            text,
-        )
-        .await;
+        // Name speakers from the stored diarization labels; live transcription stays unlabelled.
+        let text = crate::diarization::transcript_for_summary(&_app, &pool, &meeting_id, text).await;
 
         if let Some(code) = &summary_language {
             info!("📝 Summary language preference: {}", code);

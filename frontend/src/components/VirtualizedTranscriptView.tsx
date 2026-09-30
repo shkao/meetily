@@ -34,6 +34,21 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    /** Called when a speaker label is clicked, to rename that speaker */
+    onSpeakerClick?: (speaker: string) => void;
+}
+
+const SPEAKER_COLORS = [
+    'text-blue-700', 'text-emerald-700', 'text-purple-700', 'text-amber-700',
+    'text-rose-700', 'text-cyan-700', 'text-indigo-700', 'text-lime-700',
+];
+
+// Stable color per speaker label within a meeting
+function speakerColor(speaker: string): string {
+    let hash = 0;
+    for (const ch of speaker) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+    return SPEAKER_COLORS[hash % SPEAKER_COLORS.length];
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -71,6 +86,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    speaker,
+    onSpeakerClick,
 }: {
     id: string;
     timestamp: number;
@@ -78,6 +95,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    speaker?: string | null;
+    onSpeakerClick?: (speaker: string) => void;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -97,6 +116,20 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
+                    {speaker && (
+                        onSpeakerClick ? (
+                            <button
+                                type="button"
+                                onClick={() => onSpeakerClick(speaker)}
+                                className={`text-xs font-semibold ${speakerColor(speaker)} hover:underline`}
+                                title="Rename this speaker"
+                            >
+                                {speaker}
+                            </button>
+                        ) : (
+                            <span className={`text-xs font-semibold ${speakerColor(speaker)}`}>{speaker}</span>
+                        )
+                    )}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -124,6 +157,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    onSpeakerClick,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -296,6 +330,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={segment.speaker}
+                                        onSpeakerClick={onSpeakerClick}
                                     />
                                 </div>
                             );
@@ -352,6 +388,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={segment.speaker}
+                                        onSpeakerClick={onSpeakerClick}
                                     />
                                 </motion.div>
                             );

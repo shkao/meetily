@@ -285,6 +285,7 @@ pub async fn start_import<R: Runtime>(
 
     match &result {
         Ok(res) => {
+            crate::diarization::spawn_for_meeting(app.clone(), res.meeting_id.clone());
             let _ = app.emit(
                 "import-complete",
                 serde_json::json!({

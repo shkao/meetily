@@ -1,8 +1,9 @@
-//! Speaker labels for meeting minutes (issue #1).
+//! Speaker labels for finished meetings.
 //!
-//! Live transcription is unchanged. When a summary is generated, the saved `audio.mp4` is diarized with
-//! Nemotron 3 Diarization and each stored transcript segment gets the speaker who holds most of its speech.
-//! The LLM then reads `[mm:ss] Speaker N: text` lines. Any failure leaves the transcript unlabelled.
+//! Live transcription is unchanged. After a recording is saved, imported or retranscribed, the meeting's audio is
+//! diarized with Nemotron 3 Diarization in the background and each stored transcript segment gets the speaker who
+//! holds most of its speech, stored as "Speaker N" in `transcripts.speaker`. Renaming a speaker rewrites that
+//! column for the meeting. Summaries read `[mm:ss] Name: text` lines built from the stored labels.
 
 mod model;
 
@@ -10,10 +11,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use log::{info, warn};
 use model::{Diarizer, PcmFile, HOP, N_SPK, SR};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::io::AsyncWriteExt;
 
 const MODEL_DIR: &str = "nemotron-3-diarization-int8";
@@ -33,48 +36,69 @@ const DOMINANT: f64 = 0.7; // one speaker must hold this share of the active fra
 const SECOND: f64 = 0.3; // a second speaker at this share makes the segment mixed, so unnamed
 
 static DOWNLOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// One diarization at a time: it is CPU-heavy, and a summary started during a background run waits for its labels.
+static RUN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// One stored transcript segment, in the order the summary text lists them.
+/// Emitted as `diarization-progress` so the meeting page can show what is happening.
+#[derive(Clone, Serialize)]
+pub struct DiarizationProgress {
+    pub meeting_id: String,
+    /// "downloading", "diarizing", "done", "skipped" or "failed"
+    pub stage: String,
+    /// Download progress 0 to 100 while downloading
+    pub percent: Option<u32>,
+    pub message: String,
+}
+
+/// One stored transcript segment, in audio order.
 pub struct Segment {
+    pub id: String,
     pub start: Option<f64>,
     pub end: Option<f64>,
     pub timestamp: String,
     pub text: String,
+    pub speaker: Option<String>,
 }
 
-/// Rebuilds the summary transcript with speaker names, or returns None when the meeting cannot be diarized
-/// (no saved audio, no segment timings). Errors cover download, decode and inference failures.
-pub async fn speaker_labelled_transcript(
-    pool: &SqlitePool,
-    app_data_dir: &Path,
-    meeting_id: &str,
-) -> Result<Option<String>> {
-    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
-        .bind(meeting_id)
-        .fetch_optional(pool)
-        .await?
-        .flatten();
-    let Some(audio) = folder.map(|f| PathBuf::from(f).join("audio.mp4")).filter(|p| p.exists()) else {
-        info!("Diarization skipped for {}: no saved audio.mp4", meeting_id);
-        return Ok(None);
-    };
-    let rows: Vec<(Option<f64>, Option<f64>, String, String)> = sqlx::query_as(
-        "SELECT audio_start_time, audio_end_time, timestamp, transcript FROM transcripts
+async fn load_segments(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<Segment>> {
+    let rows: Vec<(String, Option<f64>, Option<f64>, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, audio_start_time, audio_end_time, timestamp, transcript, speaker FROM transcripts
          WHERE meeting_id = ? ORDER BY audio_start_time ASC",
     )
     .bind(meeting_id)
     .fetch_all(pool)
     .await?;
-    let segments: Vec<Segment> = rows
+    Ok(rows
         .into_iter()
-        .map(|(start, end, timestamp, text)| Segment { start, end, timestamp, text })
-        .collect();
+        .map(|(id, start, end, timestamp, text, speaker)| Segment { id, start, end, timestamp, text, speaker })
+        .collect())
+}
+
+/// Diarizes the meeting's saved audio and stores "Speaker N" (or NULL) on each transcript segment.
+/// Returns false when the meeting cannot be diarized (no saved audio, no segment timings).
+pub async fn diarize_meeting(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    meeting_id: &str,
+    progress: &(dyn Fn(&str, Option<u32>) + Send + Sync),
+) -> Result<bool> {
+    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+    let Some(audio) = folder.and_then(|f| crate::audio::retranscription::find_audio_file(Path::new(&f)).ok()) else {
+        info!("Diarization skipped for {}: no saved audio", meeting_id);
+        return Ok(false);
+    };
+    let segments = load_segments(pool, meeting_id).await?;
     if !segments.iter().any(|s| s.start.is_some() && s.end.is_some()) {
         info!("Diarization skipped for {}: transcript has no audio timings", meeting_id);
-        return Ok(None);
+        return Ok(false);
     }
 
-    let model_dir = ensure_model(&app_data_dir.join("models").join(MODEL_DIR)).await?;
+    let model_dir = ensure_model(&app_data_dir.join("models").join(MODEL_DIR), progress).await?;
+    progress("diarizing", None);
     let pcm = decode_to_pcm(&audio).await?;
     let started = std::time::Instant::now();
     let (probs, num_frames) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -85,6 +109,17 @@ pub async fn speaker_labelled_transcript(
     })
     .await??;
     let labels = number_speakers(&label_segments(&probs, num_frames, &segments));
+
+    let mut tx = pool.begin().await?;
+    for (seg, label) in segments.iter().zip(&labels) {
+        sqlx::query("UPDATE transcripts SET speaker = ? WHERE id = ?")
+            .bind(label.map(|n| format!("Speaker {}", n)))
+            .bind(&seg.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+
     info!(
         "Diarized {} ({:.0} s audio) in {:.1} s: {} of {} segments named, {} speakers",
         meeting_id,
@@ -94,7 +129,104 @@ pub async fn speaker_labelled_transcript(
         labels.len(),
         labels.iter().flatten().max().map_or(0, |n| *n),
     );
-    Ok(Some(format_transcript(&segments, &labels)))
+    Ok(true)
+}
+
+/// Runs `diarize_meeting` for the app, one at a time, reporting progress as `diarization-progress` events.
+pub async fn diarize_for_app<R: Runtime>(app: &AppHandle<R>, meeting_id: &str) -> Result<bool> {
+    let _run = RUN_LOCK.lock().await;
+    let pool = app.state::<crate::state::AppState>().db_manager.pool().clone();
+    let app_data_dir = app.path().app_data_dir().context("no app data dir")?;
+    let emit = |stage: &str, percent: Option<u32>, message: String| {
+        let _ = app.emit(
+            "diarization-progress",
+            DiarizationProgress { meeting_id: meeting_id.to_string(), stage: stage.to_string(), percent, message },
+        );
+    };
+    let progress = |stage: &str, percent: Option<u32>| {
+        let message = match stage {
+            "downloading" => "Downloading the speaker model (105 MB, first time only)".to_string(),
+            _ => "Identifying speakers".to_string(),
+        };
+        emit(stage, percent, message);
+    };
+    match diarize_meeting(&pool, &app_data_dir, meeting_id, &progress).await {
+        Ok(true) => {
+            emit("done", None, "Speakers identified".to_string());
+            Ok(true)
+        }
+        Ok(false) => {
+            emit("skipped", None, "No saved audio to identify speakers from".to_string());
+            Ok(false)
+        }
+        Err(e) => {
+            warn!("Diarization failed for {}: {:#}", meeting_id, e);
+            emit("failed", None, format!("Could not identify speakers: {}", e));
+            Err(e)
+        }
+    }
+}
+
+/// Starts background diarization after a meeting's transcript is saved. Failures only log and emit.
+pub fn spawn_for_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: String) {
+    tauri::async_runtime::spawn(async move {
+        let _ = diarize_for_app(&app, &meeting_id).await;
+    });
+}
+
+/// Summary transcript with speaker names from the stored labels. Diarizes first when the meeting has none yet,
+/// and falls back to the frontend's unlabelled text when that is impossible or fails.
+pub async fn transcript_for_summary<R: Runtime>(app: &AppHandle<R>, pool: &SqlitePool, meeting_id: &str, text: String) -> String {
+    let labelled = |segments: &[Segment]| segments.iter().any(|s| s.speaker.is_some());
+    let mut segments = match load_segments(pool, meeting_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Could not read transcript for speaker names: {:#}", e);
+            return text;
+        }
+    };
+    if !labelled(&segments) {
+        if !matches!(diarize_for_app(app, meeting_id).await, Ok(true)) {
+            return text;
+        }
+        segments = match load_segments(pool, meeting_id).await {
+            Ok(s) => s,
+            Err(_) => return text,
+        };
+    }
+    if labelled(&segments) { format_transcript(&segments) } else { text }
+}
+
+/// Renames one speaker across a meeting. Returns the number of segments changed.
+pub async fn rename_speaker(pool: &SqlitePool, meeting_id: &str, from: &str, to: &str) -> Result<u64> {
+    let to = to.trim();
+    if to.is_empty() {
+        bail!("Speaker name cannot be empty");
+    }
+    let result = sqlx::query("UPDATE transcripts SET speaker = ? WHERE meeting_id = ? AND speaker = ?")
+        .bind(to)
+        .bind(meeting_id)
+        .bind(from)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+#[tauri::command]
+pub async fn diarization_rename_speaker<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    from: String,
+    to: String,
+) -> Result<u64, String> {
+    let pool = app.state::<crate::state::AppState>().db_manager.pool().clone();
+    rename_speaker(&pool, &meeting_id, &from, &to).await.map_err(|e| e.to_string())
+}
+
+/// Identifies speakers on demand, for meetings saved before diarization existed or after a failed run.
+#[tauri::command]
+pub async fn diarization_run<R: Runtime>(app: AppHandle<R>, meeting_id: String) -> Result<bool, String> {
+    diarize_for_app(&app, &meeting_id).await.map_err(|e| e.to_string())
 }
 
 /// Model speaker index for each segment, or None when the segment is silent, mixed or has no timings.
@@ -150,12 +282,11 @@ fn number_speakers(labels: &[Option<usize>]) -> Vec<Option<usize>> {
         .collect()
 }
 
-/// Same line format the frontend sends (`[mm:ss] text`), with `Speaker N: ` before named segments.
-fn format_transcript(segments: &[Segment], labels: &[Option<usize>]) -> String {
+/// Same line format the frontend sends (`[mm:ss] text`), with `Name: ` before named segments.
+fn format_transcript(segments: &[Segment]) -> String {
     segments
         .iter()
-        .zip(labels)
-        .map(|(seg, label)| {
+        .map(|seg| {
             let time = match seg.start {
                 Some(s) => {
                     let secs = s.max(0.0) as u64;
@@ -163,8 +294,8 @@ fn format_transcript(segments: &[Segment], labels: &[Option<usize>]) -> String {
                 }
                 None => seg.timestamp.clone(),
             };
-            match label {
-                Some(n) => format!("{} Speaker {}: {}", time, n, seg.text),
+            match &seg.speaker {
+                Some(name) => format!("{} {}: {}", time, name, seg.text),
                 None => format!("{} {}", time, seg.text),
             }
         })
@@ -173,7 +304,7 @@ fn format_transcript(segments: &[Segment], labels: &[Option<usize>]) -> String {
 }
 
 /// Downloads the pinned model files on first use and checks their SHA-256.
-async fn ensure_model(dir: &Path) -> Result<PathBuf> {
+async fn ensure_model(dir: &Path, progress: &(dyn Fn(&str, Option<u32>) + Send + Sync)) -> Result<PathBuf> {
     let _guard = DOWNLOAD_LOCK.lock().await;
     tokio::fs::create_dir_all(dir).await?;
     let client = reqwest::Client::builder()
@@ -185,6 +316,7 @@ async fn ensure_model(dir: &Path) -> Result<PathBuf> {
             continue;
         }
         info!("Downloading diarization model file {} ({} bytes)", name, size);
+        progress("downloading", Some(0));
         let part = dir.join(format!("{}.part", name));
         let response = client
             .get(format!("{}/{}", MODEL_BASE_URL, name))
@@ -194,10 +326,17 @@ async fn ensure_model(dir: &Path) -> Result<PathBuf> {
         let mut file = tokio::fs::File::create(&part).await?;
         let mut hasher = Sha256::new();
         let mut stream = response.bytes_stream();
+        let (mut done, mut reported) = (0u64, 0u32);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             hasher.update(&chunk);
             file.write_all(&chunk).await?;
+            done += chunk.len() as u64;
+            let percent = (done * 100 / size) as u32;
+            if percent >= reported + 5 {
+                reported = percent;
+                progress("downloading", Some(percent.min(100)));
+            }
         }
         file.flush().await?;
         drop(file);
@@ -240,30 +379,12 @@ async fn decode_to_pcm(audio: &Path) -> Result<tempfile::TempPath> {
     Ok(out)
 }
 
-/// Runs diarization for the summary, falling back to the frontend's unlabelled text on any failure.
-pub async fn transcript_for_summary(
-    pool: &SqlitePool,
-    app_data_dir: Option<&Path>,
-    meeting_id: &str,
-    text: String,
-) -> String {
-    let Some(dir) = app_data_dir else { return text };
-    match speaker_labelled_transcript(pool, dir, meeting_id).await {
-        Ok(Some(labelled)) => labelled,
-        Ok(None) => text,
-        Err(e) => {
-            warn!("Diarization failed for {}, summarizing without speaker names: {:#}", meeting_id, e);
-            text
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn seg(start: f64, end: f64, text: &str) -> Segment {
-        Segment { start: Some(start), end: Some(end), timestamp: String::new(), text: text.into() }
+        Segment { id: String::new(), start: Some(start), end: Some(end), timestamp: String::new(), text: text.into(), speaker: None }
     }
 
     // probs for `secs` seconds where `who(t)` lists the active speakers at frame t
@@ -317,19 +438,55 @@ mod tests {
         assert!((flips as f64) < 0.001 * probs.len() as f64);
     }
 
-    /// Downloads the model into DIARIZATION_APP_DIR and labels a meeting from a copy of the app database.
+    /// Downloads the model into DIARIZATION_APP_DIR and labels a meeting in a temp copy of the app database.
     /// DIARIZATION_DB=<sqlite> DIARIZATION_MEETING=<id> DIARIZATION_APP_DIR=<dir> cargo test --lib diarization -- --ignored
     #[tokio::test]
     #[ignore]
     async fn labels_a_saved_meeting() {
         let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
-        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=ro", env("DIARIZATION_DB"))).await.unwrap();
-        let text = speaker_labelled_transcript(&pool, Path::new(&env("DIARIZATION_APP_DIR")), &env("DIARIZATION_MEETING"))
+        let copy = tempfile::NamedTempFile::new().unwrap();
+        std::fs::copy(env("DIARIZATION_DB"), copy.path()).unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite://{}", copy.path().display())).await.unwrap();
+        let meeting = env("DIARIZATION_MEETING");
+        let ran = diarize_meeting(&pool, Path::new(&env("DIARIZATION_APP_DIR")), &meeting, &|stage, pct| println!("{stage} {pct:?}"))
             .await
-            .unwrap()
-            .expect("meeting has audio and timings");
+            .unwrap();
+        assert!(ran, "meeting has audio and timings");
+        let text = format_transcript(&load_segments(&pool, &meeting).await.unwrap());
         println!("{text}");
         assert!(text.contains("Speaker 1: "));
+    }
+
+    async fn transcripts_db(rows: &[(&str, &str, Option<&str>)]) -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE transcripts (id TEXT, meeting_id TEXT, transcript TEXT, timestamp TEXT,
+                     audio_start_time REAL, audio_end_time REAL, speaker TEXT)")
+            .execute(&pool).await.unwrap();
+        for (i, (meeting, text, speaker)) in rows.iter().enumerate() {
+            sqlx::query("INSERT INTO transcripts VALUES (?, ?, ?, '', ?, ?, ?)")
+                .bind(format!("t{i}")).bind(meeting).bind(text)
+                .bind(i as f64 * 10.0).bind(i as f64 * 10.0 + 5.0).bind(speaker)
+                .execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn renames_one_speaker_in_one_meeting() {
+        let pool = transcripts_db(&[
+            ("m1", "hi", Some("Speaker 1")),
+            ("m1", "hello", Some("Speaker 2")),
+            ("m1", "mm", None),
+            ("m1", "bye", Some("Speaker 2")),
+            ("m2", "other", Some("Speaker 2")),
+        ]).await;
+        assert_eq!(rename_speaker(&pool, "m1", "Speaker 2", " Priya ").await.unwrap(), 2);
+        assert!(rename_speaker(&pool, "m1", "Speaker 1", "  ").await.is_err());
+        assert_eq!(
+            format_transcript(&load_segments(&pool, "m1").await.unwrap()),
+            "[00:00] Speaker 1: hi\n[00:10] Priya: hello\n[00:20] mm\n[00:30] Priya: bye"
+        );
+        assert_eq!(load_segments(&pool, "m2").await.unwrap()[0].speaker.as_deref(), Some("Speaker 2"));
     }
 
     #[test]
@@ -342,13 +499,13 @@ mod tests {
 
     #[test]
     fn formats_like_the_frontend_with_names() {
-        let segs = [
-            seg(65.4, 70.0, "hello"),
-            seg(71.0, 72.0, "hmm"),
-            Segment { start: None, end: None, timestamp: "2025-01-01T10:00:00Z".into(), text: "old".into() },
-        ];
+        let mut segs = vec![seg(65.4, 70.0, "hello"), seg(71.0, 72.0, "hmm")];
+        segs[0].speaker = Some("Speaker 1".into());
+        segs.push(Segment {
+            id: String::new(), start: None, end: None, timestamp: "2025-01-01T10:00:00Z".into(), text: "old".into(), speaker: None,
+        });
         assert_eq!(
-            format_transcript(&segs, &[Some(1), None, None]),
+            format_transcript(&segs),
             "[01:05] Speaker 1: hello\n[01:11] hmm\n2025-01-01T10:00:00Z old"
         );
     }
