@@ -24,6 +24,8 @@ const PARTIAL_AUDIO_FILE: &str = "audio.partial.mp4";
 pub struct IncrementalAudioSaver {
     encoder: Option<Child>,
     encoder_stdin: Option<ChildStdin>,
+    /// Reads the encoder's stderr while it runs, so a full pipe can never stall it; yields the output at the end
+    encoder_stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
     /// First encoder failure; later chunks are dropped and finalize reports it
     encoder_error: Option<String>,
     samples_written: u64,
@@ -50,6 +52,7 @@ impl IncrementalAudioSaver {
         Ok(Self {
             encoder: None,
             encoder_stdin: None,
+            encoder_stderr: None,
             encoder_error: None,
             samples_written: 0,
             checkpoint_count: 0,
@@ -79,6 +82,8 @@ impl IncrementalAudioSaver {
         let mut command = Command::new(ffmpeg_path);
         command
             .args([
+                // errors only: ffmpeg's progress lines would otherwise stream to stderr for the whole meeting
+                "-hide_banner", "-nostats", "-loglevel", "error",
                 "-f", "f32le",
                 "-ar", &self.sample_rate.to_string(),
                 "-ac", "1",
@@ -105,6 +110,7 @@ impl IncrementalAudioSaver {
 
         let mut child = command.spawn()?;
         self.encoder_stdin = child.stdin.take();
+        self.encoder_stderr = child.stderr.take().map(drain_stderr);
         self.encoder = Some(child);
         Ok(())
     }
@@ -155,13 +161,14 @@ impl IncrementalAudioSaver {
 
         // Closing stdin ends the stream; ffmpeg then flushes the encoder and writes the mp4 index
         drop(self.encoder_stdin.take());
-        let encoder = self.encoder.take().ok_or_else(|| anyhow!("Audio encoder was not running"))?;
-        let output = encoder.wait_with_output()?;
+        let mut encoder = self.encoder.take().ok_or_else(|| anyhow!("Audio encoder was not running"))?;
+        let status = encoder.wait()?;
+        let stderr_bytes = self.encoder_stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
         if let Some(e) = &self.encoder_error {
             return Err(anyhow!("Audio encoding failed during recording: {}", e));
         }
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             error!("FFmpeg encoder failed");
             return Err(anyhow!("FFmpeg encoder failed: {}", stderr));
         }
@@ -405,6 +412,27 @@ pub async fn has_audio_checkpoints(meeting_folder: String) -> Result<bool, Strin
     Ok(has_mp4_files)
 }
 
+/// Reads a child's stderr on a thread until it closes, keeping the last 64 KB for error messages. Without it, a
+/// child that writes more than the pipe buffer blocks on stderr and stops reading its input.
+fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        const KEEP: usize = 64 * 1024;
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            kept.extend_from_slice(&buf[..n]);
+            if kept.len() > KEEP {
+                kept.drain(..kept.len() - KEEP);
+            }
+        }
+        kept
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +582,28 @@ mod tests {
         let result = saver.finalize().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No audio checkpoints"));
+    }
+
+    /// A child that writes more to stderr than a pipe holds must still finish once its stderr is drained. Before
+    /// the drain, the encoder blocked like this after about 7.5 minutes of real-time progress lines and stopped
+    /// reading audio, so recordings stopped growing and finalize timed out.
+    #[test]
+    fn drained_stderr_never_blocks_the_child() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "head -c 300000 /dev/zero | tr '\\0' x >&2; cat > /dev/null"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let drain = drain_stderr(child.stderr.take().unwrap());
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&[0u8; 100_000]).unwrap();
+        drop(stdin);
+        let started = std::time::Instant::now();
+        assert!(child.wait().unwrap().success());
+        let kept = drain.join().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(kept.len(), 64 * 1024);
+        assert!(kept.iter().all(|&b| b == b'x'));
     }
 }
