@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 const invokeMock = mock(async () => null);
 
@@ -52,12 +52,6 @@ describe("summary language local fallback", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     storageValues = installLocalStorage();
-  });
-
-  // Other test files run in the same process; a leftover fake window makes libraries such as
-  // framer-motion take their browser path and fail during server rendering.
-  afterAll(() => {
-    delete globalThis.window;
   });
 
   test("reads summary language from local fallback when meeting has no folder", async () => {
