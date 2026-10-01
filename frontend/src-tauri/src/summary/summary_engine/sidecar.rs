@@ -21,6 +21,13 @@ use super::models;
 // Sidecar State Management
 // ============================================================================
 
+/// A streamed text line from llama-helper, sent before the final response.
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StreamedToken {
+    Token { text: String },
+}
+
 /// Sidecar process manager with keep-alive and health monitoring
 pub struct SidecarManager {
     /// Child process handle
@@ -348,8 +355,14 @@ impl SidecarManager {
         Ok(())
     }
 
-    /// Send a request to the sidecar and wait for response
-    pub async fn send_request(&self, request_json: String, timeout: Duration) -> Result<String> {
+    /// Send a request to the sidecar and wait for response. Streamed `token` lines go to `on_token`
+    /// until the final response arrives.
+    pub async fn send_request(
+        &self,
+        request_json: String,
+        timeout: Duration,
+        on_token: Option<&(dyn Fn(&str) + Send + Sync)>,
+    ) -> Result<String> {
         // Track active request
         let _guard = RequestGuard::new(self.active_request_count.clone());
 
@@ -372,7 +385,19 @@ impl SidecarManager {
         }
 
         // Read response from stdout with timeout
-        match tokio::time::timeout(timeout, self.read_response()).await {
+        let read_final = async {
+            loop {
+                let line = self.read_response().await?;
+                if let Ok(StreamedToken::Token { text }) = serde_json::from_str::<StreamedToken>(&line) {
+                    if let Some(on_token) = on_token {
+                        on_token(&text);
+                    }
+                    continue;
+                }
+                return Ok::<String, anyhow::Error>(line);
+            }
+        };
+        match tokio::time::timeout(timeout, read_final).await {
             Ok(Ok(response)) => {
                 self.update_activity().await;
                 Ok(response)

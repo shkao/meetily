@@ -37,6 +37,8 @@ enum Request {
         repeat_penalty: Option<f32>,
         penalty_last_n: Option<i32>,
         stop_tokens: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stream: Option<bool>,
     },
 }
 
@@ -136,6 +138,7 @@ pub async fn generate_with_builtin(
     system_prompt: &str,
     user_prompt: &str,
     cancellation_token: Option<&CancellationToken>,
+    on_token: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<String> {
     // Check cancellation at start
     if let Some(token) = cancellation_token {
@@ -193,6 +196,7 @@ pub async fn generate_with_builtin(
         repeat_penalty: Some(sampling.repeat_penalty),
         penalty_last_n: Some(sampling.penalty_last_n),
         stop_tokens: Some(sampling.stop_tokens),
+        stream: on_token.map(|_| true),
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -205,7 +209,7 @@ pub async fn generate_with_builtin(
     // Race between send_request and cancellation token
     let response_json = if let Some(token) = cancellation_token {
         tokio::select! {
-            result = manager.send_request(request_json, timeout) => {
+            result = manager.send_request(request_json, timeout, on_token) => {
                 result?
             }
             _ = token.cancelled() => {
@@ -218,7 +222,7 @@ pub async fn generate_with_builtin(
             }
         }
     } else {
-        manager.send_request(request_json, timeout).await?
+        manager.send_request(request_json, timeout, on_token).await?
     };
 
     // Check cancellation before parsing response
@@ -317,9 +321,11 @@ mod tests {
             repeat_penalty: Some(1.05),
             penalty_last_n: Some(256),
             stop_tokens: Some(vec!["<end_of_turn>".to_string()]),
+            stream: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("stream"), "non-streaming requests keep the old shape");
         assert!(json.contains("\"type\":\"generate\""));
         assert!(json.contains("\"prompt\":\"test prompt\""));
         assert!(json.contains("\"max_tokens\":512"));
