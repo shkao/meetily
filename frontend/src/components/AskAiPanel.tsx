@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import ReactMarkdown from 'react-markdown';
-import { AlertCircle, Check, Copy, CornerDownRight, Loader2, Lock, RotateCcw, Send, Sparkles, X } from 'lucide-react';
+import { AlertCircle, ArrowUpRight, Check, Copy, History, ListChecks, Loader2, Lock, RotateCcw, Send, Sparkles, TextQuote, Users, X } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 
 interface Message {
@@ -18,11 +19,11 @@ interface Message {
   error?: string;
 }
 
-const QUICK_PROMPTS = [
-  'Summarize the discussion so far',
-  'What was discussed in the last two minutes?',
-  'What decisions and action items came up?',
-  'What has each speaker said?',
+const QUICK_PROMPTS: { text: string; icon: LucideIcon }[] = [
+  { text: 'Summarize the discussion so far', icon: TextQuote },
+  { text: 'What was discussed in the last two minutes?', icon: History },
+  { text: 'What decisions and action items came up?', icon: ListChecks },
+  { text: 'What has each speaker said?', icon: Users },
 ];
 
 // A bracketed group holding one or more mm:ss times: "[03:15]", "[00:39–02:24]", or the malformed "[07:24–[09:16]"
@@ -112,18 +113,15 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
     }
   };
 
-  // Scrolls the live transcript to the segment that contains the cited time
+  // Asks the live transcript to show the segment that contains the cited time
   const jumpTo = (seconds: number) => {
     const segments = transcriptsRef.current.filter(t => t.audio_start_time !== undefined);
     let target = segments[0];
     for (const t of segments) {
-      if ((t.audio_start_time ?? 0) <= seconds) target = t;
+      // cited times are shown rounded down, like the transcript's [mm:ss]
+      if (Math.floor(t.audio_start_time ?? 0) <= seconds) target = t;
     }
-    if (!target) return;
-    const el = document.getElementById(`segment-${target.id}`);
-    el?.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' });
-    el?.classList.add('bg-yellow-100');
-    setTimeout(() => el?.classList.remove('bg-yellow-100'), 1500);
+    if (target) window.dispatchEvent(new CustomEvent('transcript-jump', { detail: { id: target.id } }));
   };
 
   const copy = async (m: Message) => {
@@ -160,22 +158,33 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
     </ReactMarkdown>
   );
 
-  const suggestions = (
-    <ul className="flex flex-col" aria-label="Suggested questions">
-      {QUICK_PROMPTS.map(p => (
-        <li key={p}>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => ask(p)}
-            className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <CornerDownRight className="h-4 w-4 flex-shrink-0 text-gray-500" aria-hidden="true" />
-            {p}
-          </button>
-        </li>
-      ))}
-    </ul>
+  const suggestions = (exclude?: string) => (
+    <section aria-labelledby="ask-ai-suggestions" className="space-y-2">
+      <h3 id="ask-ai-suggestions" className="text-xs font-medium text-gray-500">
+        {exclude ? 'Ask next' : 'Try asking'}
+      </h3>
+      <ul className="flex flex-col gap-2">
+        {QUICK_PROMPTS.filter(p => p.text !== exclude).map(({ text, icon: Icon }) => (
+          <li key={text}>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => ask(text)}
+              className="group flex min-h-11 w-full items-center gap-3 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-left text-sm text-gray-800 transition-[transform,background-color,border-color,box-shadow] duration-100 ease-out hover:border-gray-300 hover:bg-white hover:shadow-sm active:scale-[0.98] active:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-gray-200 disabled:hover:bg-gray-50 disabled:hover:shadow-none disabled:active:scale-100 motion-reduce:transition-colors motion-reduce:active:scale-100"
+            >
+              <span className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-600" aria-hidden="true">
+                <Icon className="h-4 w-4" />
+              </span>
+              <span className="flex-1 leading-snug">{text}</span>
+              <ArrowUpRight
+                className="h-4 w-4 flex-shrink-0 text-gray-400 transition-colors group-hover:text-blue-600 group-disabled:group-hover:text-gray-400"
+                aria-hidden="true"
+              />
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 
   const last = messages[messages.length - 1];
@@ -210,7 +219,7 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
             <p className="text-gray-600">
               Ask about the meeting so far. Answers cite transcript times you can click.
             </p>
-            {suggestions}
+            {suggestions()}
             <p className="text-xs text-gray-500">
               Questions about who said what take longer: speakers are identified from the audio and numbered, not named.
             </p>
@@ -280,7 +289,7 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
           );
         })}
 
-        {showFollowUps && <div className="border-t border-gray-100 pt-3">{suggestions}</div>}
+        {showFollowUps && <div className="border-t border-gray-100 pt-4">{suggestions(last.question)}</div>}
         <div ref={endRef} />
       </div>
 
@@ -313,3 +322,4 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
     </aside>
   );
 }
+
