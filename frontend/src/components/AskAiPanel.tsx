@@ -11,6 +11,8 @@ interface Message {
   question: string;
   /** Text streamed so far by local providers, replaced by `answer` when done */
   partial?: string;
+  /** Progress note while the answer is prepared, such as identifying speakers */
+  status?: string;
   answer?: string;
   error?: string;
 }
@@ -43,18 +45,20 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
   }, [messages]);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
     let cancelled = false;
+    const unlisteners: (() => void)[] = [];
+    const keep = (u: () => void) => (cancelled ? u() : unlisteners.push(u));
     listen<{ request_id: string; text: string }>('ask-ai-token', (event) => {
       const { request_id, text } = event.payload;
       setMessages(prev => prev.map(m => (m.id === request_id ? { ...m, partial: (m.partial ?? '') + text } : m)));
-    }).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
+    }).then(keep);
+    listen<{ request_id: string; message: string }>('ask-ai-status', (event) => {
+      const { request_id, message } = event.payload;
+      setMessages(prev => prev.map(m => (m.id === request_id ? { ...m, status: message } : m)));
+    }).then(keep);
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlisteners.forEach(u => u());
     };
   }, []);
 
@@ -65,7 +69,11 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
     setBusy(true);
     const id = crypto.randomUUID();
     setMessages(prev => [...prev, { id, question: q }]);
-    const lines = transcriptsRef.current.map(t => ({ start: t.audio_start_time ?? null, text: t.text }));
+    const lines = transcriptsRef.current.map(t => ({
+      start: t.audio_start_time ?? null,
+      end: t.audio_end_time ?? null,
+      text: t.text,
+    }));
     try {
       const answer = await invoke<string>('ask_ai_live', { requestId: id, question: q, lines });
       setMessages(prev => prev.map(m => (m.id === id ? { ...m, answer } : m)));
@@ -130,7 +138,8 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
         {messages.length === 0 && (
           <p className="text-gray-500">
             Ask about the meeting so far. Only you see the answers, and they're cleared when the recording ends.
-            Speaker names aren't available until after the meeting.
+            Questions about who said what take a little longer: speakers are identified from the audio so far and
+            numbered, not named.
           </p>
         )}
         {messages.map(m => (
@@ -139,13 +148,16 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
             {m.answer !== undefined && (
               <div className="text-gray-700 whitespace-pre-wrap leading-relaxed">{renderAnswer(m.answer)}</div>
             )}
+            {m.answer !== undefined && m.status?.startsWith("Couldn't") && (
+              <div className="text-xs text-gray-400">{m.status}</div>
+            )}
             {m.error && <div className="text-red-600">{m.error}</div>}
             {m.answer === undefined && !m.error && m.partial && (
               <div className="text-gray-700 whitespace-pre-wrap leading-relaxed">{renderAnswer(m.partial)}</div>
             )}
             {m.answer === undefined && !m.error && (
               <div className="flex items-center gap-2 text-gray-400">
-                <Loader2 className="w-3 h-3 animate-spin" /> {m.partial ? 'Writing...' : 'Thinking...'}
+                <Loader2 className="w-3 h-3 animate-spin" /> {m.partial ? 'Writing...' : m.status ?? 'Thinking...'}
               </div>
             )}
           </div>
