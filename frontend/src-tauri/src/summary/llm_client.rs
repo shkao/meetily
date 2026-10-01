@@ -541,6 +541,29 @@ mod tests {
         assert_eq!(sse_delta_text(": keep-alive"), None);
     }
 
+    #[test]
+    fn keeps_characters_split_across_chunks() {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"會議\"}}]}\n".as_bytes();
+        let cut = event.iter().position(|&b| b >= 0x80).unwrap() + 1; // inside the first CJK character
+        let mut pending = event[..cut].to_vec();
+        assert!(take_lines(&mut pending).is_empty());
+        pending.extend_from_slice(&event[cut..]);
+        let lines = take_lines(&mut pending);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(sse_delta_text(lines[0].trim()).as_deref(), Some("會議"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn reads_errors_from_sse_lines() {
+        assert_eq!(
+            sse_error(r#"data: {"error":{"message":"model not found"}}"#).as_deref(),
+            Some("model not found")
+        );
+        assert_eq!(sse_error(r#"data: {"choices":[{"delta":{"content":"x"}}]}"#), None);
+        assert_eq!(sse_error("data: [DONE]"), None);
+    }
+
     use super::*;
     use serde_json::json;
     use std::{cell::Cell, task::Poll};
@@ -1031,32 +1054,60 @@ pub(crate) async fn generate_streaming(
                 provider, model_name, system_prompt, user_prompt, max_tokens, temperature, top_p,
             );
             body["stream"] = serde_json::Value::Bool(true);
-            let response = client
-                .post(format!("{}/v1/chat/completions", host))
-                .json(&body)
-                .timeout(REQUEST_TIMEOUT_DURATION)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to send request to LLM: {}", e))?;
+            // Same request shape as generate_summary: bearer header, and one retry without reasoning_effort
+            // for Ollama builds that reject it
+            let send = |body: &serde_json::Value| {
+                client
+                    .post(format!("{}/v1/chat/completions", host))
+                    .bearer_auth(api_key)
+                    .json(body)
+                    .timeout(REQUEST_TIMEOUT_DURATION)
+                    .send()
+            };
+            let mut response = send(&body).await.map_err(|e| format!("Failed to send request to LLM: {}", e))?;
             if !response.status().is_success() {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
-                return Err(format!("LLM request failed with status {}: {}", status, text));
+                if !ollama_rejects_reasoning_effort(status, &text) {
+                    return Err(format!("LLM request failed with status {}: {}", status, text));
+                }
+                warn!("Ollama rejected reasoning_effort; retrying once without it");
+                if let Some(fields) = body.as_object_mut() {
+                    fields.remove("reasoning_effort");
+                }
+                response = send(&body).await.map_err(|e| format!("Failed to send request to LLM: {}", e))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(format!("LLM request failed with status {}: {}", status, text));
+                }
             }
             let mut content = String::new();
-            let mut pending = String::new();
+            // Split on newlines in bytes and decode whole lines, so a character split across network chunks
+            // stays intact
+            let mut pending: Vec<u8> = Vec::new();
             let mut stream = response.bytes_stream();
+            let mut handle_line = |line: &str, content: &mut String| -> Result<(), String> {
+                let line = line.trim();
+                if let Some(message) = sse_error(line) {
+                    return Err(format!("LLM stream failed: {}", message));
+                }
+                if let Some(text) = sse_delta_text(line) {
+                    on_token(&text);
+                    content.push_str(&text);
+                }
+                Ok(())
+            };
             while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
                 let chunk = chunk.map_err(|e| format!("LLM stream failed: {}", e))?;
-                pending.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(newline) = pending.find('\n') {
-                    let line = pending[..newline].trim().to_string();
-                    pending.drain(..=newline);
-                    if let Some(text) = sse_delta_text(&line) {
-                        on_token(&text);
-                        content.push_str(&text);
-                    }
+                pending.extend_from_slice(&chunk);
+                for line in take_lines(&mut pending) {
+                    handle_line(&line, &mut content)?;
                 }
+            }
+            handle_line(&String::from_utf8_lossy(&pending), &mut content)?;
+            if content.trim().is_empty() {
+                return Err("LLM returned an empty answer".to_string());
             }
             Ok(LlmCompletion { content, reasoning_stripped: false })
         }
@@ -1066,6 +1117,24 @@ pub(crate) async fn generate_streaming(
         )
         .await,
     }
+}
+
+/// Removes the complete lines from `pending` and decodes each whole, so UTF-8 split across chunks survives.
+fn take_lines(pending: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(newline) = pending.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = pending.drain(..=newline).collect();
+        lines.push(String::from_utf8_lossy(&line).into_owned());
+    }
+    lines
+}
+
+/// Error message in one OpenAI-compatible server-sent event line (`data: {"error": ...}`), if it carries one.
+fn sse_error(line: &str) -> Option<String> {
+    let data = line.strip_prefix("data:")?.trim();
+    let event: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = event.get("error")?;
+    Some(error.get("message").and_then(|m| m.as_str()).map(String::from).unwrap_or_else(|| error.to_string()))
 }
 
 /// Text in one OpenAI-compatible server-sent event line (`data: {...choices[0].delta.content...}`).
