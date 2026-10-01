@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { CornerDownRight, Loader2, Send, Sparkles, X } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import { AlertCircle, Check, Copy, CornerDownRight, Loader2, Lock, RotateCcw, Send, Sparkles, X } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 
 interface Message {
@@ -24,7 +25,23 @@ const QUICK_PROMPTS = [
   'What has each speaker said?',
 ];
 
-const TIME_PATTERN = /\[(\d{1,2}):(\d{2})\]/g;
+// A bracketed group holding one or more mm:ss times: "[03:15]", "[00:39–02:24]", or the malformed "[07:24–[09:16]"
+const CITATION_GROUP = /\[([^\]\n]*?\d{1,2}:\d{2}[^\]\n]*?)\]/g;
+const TIME = /(\d{1,2}):(\d{2})/g;
+const TIME_LINK_PREFIX = '#t-';
+
+/** Turns cited times into markdown links that render as clickable time chips. */
+function linkCitations(text: string): string {
+  return text.replace(CITATION_GROUP, (_, inner: string) =>
+    inner
+      .replace(/\[/g, '')
+      .replace(TIME, (t, mm, ss) => `[${t}](${TIME_LINK_PREFIX}${Number(mm) * 60 + Number(ss)})`)
+  );
+}
+
+function prefersReducedMotion(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
 
 interface AskAiPanelProps {
   onClose: () => void;
@@ -39,11 +56,20 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+    endRef.current?.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
   useEffect(() => {
     let cancelled = false;
@@ -82,6 +108,7 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
       setMessages(prev => prev.map(m => (m.id === id ? { ...m, error: String(e) } : m)));
     } finally {
       setBusy(false);
+      inputRef.current?.focus();
     }
   };
 
@@ -94,111 +121,195 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
     }
     if (!target) return;
     const el = document.getElementById(`segment-${target.id}`);
-    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el?.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' });
     el?.classList.add('bg-yellow-100');
     setTimeout(() => el?.classList.remove('bg-yellow-100'), 1500);
   };
 
-  const renderAnswer = (text: string) => {
-    const parts: React.ReactNode[] = [];
-    let last = 0;
-    for (const match of text.matchAll(TIME_PATTERN)) {
-      const index = match.index ?? 0;
-      parts.push(text.slice(last, index));
-      const seconds = Number(match[1]) * 60 + Number(match[2]);
-      parts.push(
-        <button
-          key={`${index}-${match[0]}`}
-          type="button"
-          onClick={() => jumpTo(seconds)}
-          className="text-blue-600 hover:underline font-mono text-xs"
-          title="Show in transcript"
-        >
-          {match[0]}
-        </button>
-      );
-      last = index + match[0].length;
-    }
-    parts.push(text.slice(last));
-    return parts;
+  const copy = async (m: Message) => {
+    if (!m.answer) return;
+    await navigator.clipboard.writeText(m.answer);
+    setCopiedId(m.id);
+    setTimeout(() => setCopiedId(id => (id === m.id ? null : id)), 1500);
   };
 
-  return (
-    <aside className="w-[360px] flex-shrink-0 h-full border-l border-gray-200 bg-white flex flex-col">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200">
-        <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
-          <Sparkles className="w-4 h-4 text-blue-600" />
-          Ask AI
-        </div>
-        <button type="button" onClick={onClose} className="text-gray-400 hover:text-gray-600" title="Close">
-          <X className="w-4 h-4" />
-        </button>
-      </div>
+  const renderAnswer = (text: string) => (
+    <ReactMarkdown
+      components={{
+        a: ({ href, children }) => {
+          if (!href?.startsWith(TIME_LINK_PREFIX)) return <span>{children}</span>;
+          const seconds = Number(href.slice(TIME_LINK_PREFIX.length));
+          return (
+            <button
+              type="button"
+              onClick={() => jumpTo(seconds)}
+              aria-label={`Show ${children} in the transcript`}
+              className="mx-0.5 inline-flex items-center rounded bg-blue-50 px-1.5 py-0.5 align-baseline text-xs font-medium tabular-nums text-blue-700 hover:bg-blue-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+            >
+              {children}
+            </button>
+          );
+        },
+        p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+        ul: ({ children }) => <ul className="mb-2 list-disc space-y-1 pl-4 last:mb-0">{children}</ul>,
+        ol: ({ children }) => <ol className="mb-2 list-decimal space-y-1 pl-4 last:mb-0">{children}</ol>,
+        strong: ({ children }) => <strong className="font-semibold text-gray-900">{children}</strong>,
+      }}
+    >
+      {linkCitations(text)}
+    </ReactMarkdown>
+  );
 
-      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4 text-sm">
-        {messages.length === 0 && (
-          <p className="text-gray-500">
-            Ask about the meeting so far. Only you see the answers, and they're cleared when the recording ends.
-            Questions about who said what take a little longer: speakers are identified from the audio so far and
-            numbered, not named.
+  const suggestions = (
+    <ul className="flex flex-col" aria-label="Suggested questions">
+      {QUICK_PROMPTS.map(p => (
+        <li key={p}>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => ask(p)}
+            className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <CornerDownRight className="h-4 w-4 flex-shrink-0 text-gray-500" aria-hidden="true" />
+            {p}
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+
+  const last = messages[messages.length - 1];
+  const showFollowUps = last && !busy && (last.answer !== undefined || last.error);
+
+  return (
+    <aside className="flex h-full w-[360px] flex-shrink-0 flex-col border-l border-gray-200 bg-white" aria-label="Ask AI">
+      <header className="flex items-start justify-between border-b border-gray-200 px-4 py-3">
+        <div>
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-900">
+            <Sparkles className="h-4 w-4 text-blue-600" aria-hidden="true" />
+            Ask AI
+          </h2>
+          <p className="mt-0.5 flex items-center gap-1 text-xs text-gray-500">
+            <Lock className="h-3 w-3" aria-hidden="true" />
+            Only you can see this. Cleared when the recording ends.
           </p>
-        )}
-        {messages.map(m => (
-          <div key={m.id} className="space-y-1">
-            <div className="font-medium text-gray-800">{m.question}</div>
-            {m.answer !== undefined && (
-              <div className="text-gray-700 whitespace-pre-wrap leading-relaxed">{renderAnswer(m.answer)}</div>
-            )}
-            {m.answer !== undefined && m.status?.startsWith("Couldn't") && (
-              <div className="text-xs text-gray-400">{m.status}</div>
-            )}
-            {m.error && <div className="text-red-600">{m.error}</div>}
-            {m.answer === undefined && !m.error && m.partial && (
-              <div className="text-gray-700 whitespace-pre-wrap leading-relaxed">{renderAnswer(m.partial)}</div>
-            )}
-            {m.answer === undefined && !m.error && (
-              <div className="flex items-center gap-2 text-gray-400">
-                <Loader2 className="w-3 h-3 animate-spin" /> {m.partial ? 'Writing...' : m.status ?? 'Thinking...'}
-              </div>
-            )}
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close Ask AI"
+          className="-mr-1 rounded-md p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+        >
+          <X className="h-4 w-4" aria-hidden="true" />
+        </button>
+      </header>
+
+      <div className="flex-1 space-y-5 overflow-y-auto px-4 py-4 text-sm">
+        {messages.length === 0 && (
+          <div className="space-y-3">
+            <p className="text-gray-600">
+              Ask about the meeting so far. Answers cite transcript times you can click.
+            </p>
+            {suggestions}
+            <p className="text-xs text-gray-500">
+              Questions about who said what take longer: speakers are identified from the audio and numbered, not named.
+            </p>
           </div>
-        ))}
+        )}
+
+        {messages.map(m => {
+          const pending = m.answer === undefined && !m.error;
+          return (
+            <article key={m.id} className="space-y-2">
+              <div className="flex justify-end">
+                <p className="max-w-[85%] rounded-2xl rounded-br-sm bg-gray-100 px-3 py-2 text-gray-900">{m.question}</p>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-gray-500">
+                    <Sparkles className="h-3.5 w-3.5 text-blue-600" aria-hidden="true" />
+                    AI answer
+                  </span>
+                  {m.answer && (
+                    <button
+                      type="button"
+                      onClick={() => copy(m)}
+                      aria-label={copiedId === m.id ? 'Copied' : 'Copy answer'}
+                      className="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    >
+                      {copiedId === m.id ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+                    </button>
+                  )}
+                </div>
+
+                {(m.answer ?? m.partial) && (
+                  <div className="leading-relaxed text-gray-800">{renderAnswer(m.answer ?? m.partial ?? '')}</div>
+                )}
+
+                {pending && (
+                  <p role="status" className="flex items-center gap-2 text-xs text-gray-500">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                    {m.partial ? 'Writing...' : m.status ?? 'Reading the transcript...'}
+                  </p>
+                )}
+
+                {m.answer !== undefined && m.status?.startsWith("Couldn't") && (
+                  <p className="text-xs text-gray-500">{m.status}</p>
+                )}
+
+                {m.error && (
+                  <div role="alert" className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-red-800">
+                    <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
+                    <div className="space-y-1">
+                      <p>{m.error}</p>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => ask(m.question)}
+                        className="inline-flex items-center gap-1 text-xs font-medium text-red-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-50"
+                      >
+                        <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                        Try again
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </article>
+          );
+        })}
+
+        {showFollowUps && <div className="border-t border-gray-100 pt-3">{suggestions}</div>}
         <div ref={endRef} />
       </div>
 
-      <div className="border-t border-gray-200 p-3 space-y-2">
-        <div className="flex flex-col">
-          {QUICK_PROMPTS.map(p => (
-            <button
-              key={p}
-              type="button"
-              disabled={busy}
-              onClick={() => ask(p)}
-              className="flex items-center gap-2 px-1 py-1.5 text-left text-sm text-gray-700 rounded hover:bg-gray-50 disabled:opacity-50"
-            >
-              <CornerDownRight className="w-4 h-4 flex-shrink-0 text-gray-400" />
-              {p}
-            </button>
-          ))}
-        </div>
-        <form
-          className="flex items-center gap-2"
-          onSubmit={e => {
-            e.preventDefault();
-            ask(input);
-          }}
+      <form
+        className="flex items-center gap-2 border-t border-gray-200 p-3"
+        onSubmit={e => {
+          e.preventDefault();
+          ask(input);
+        }}
+      >
+        <label htmlFor="ask-ai-input" className="sr-only">Ask about this meeting</label>
+        <input
+          id="ask-ai-input"
+          ref={inputRef}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          placeholder="Ask about this meeting"
+          autoComplete="off"
+          className="h-10 flex-1 rounded-full border border-gray-300 px-4 text-sm text-gray-900 placeholder:text-gray-500 focus-visible:border-blue-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30"
+        />
+        <button
+          type="submit"
+          disabled={busy || !input.trim()}
+          aria-label="Ask"
+          className="flex h-10 w-10 items-center justify-center rounded-full bg-blue-600 text-white hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:bg-gray-200 disabled:text-gray-500"
         >
-          <input
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            placeholder="Ask about this meeting"
-            className="flex-1 px-3 py-2 border border-gray-200 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
-          />
-          <button type="submit" disabled={busy || !input.trim()} className="text-blue-600 disabled:text-gray-300" title="Ask">
-            <Send className="w-4 h-4" />
-          </button>
-        </form>
-      </div>
+          {busy ? <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Send className="h-4 w-4" aria-hidden="true" />}
+        </button>
+      </form>
     </aside>
   );
 }
