@@ -38,7 +38,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
-      - run: bun test
+      # --isolate: Bun shares globals and module mocks across files by default, and several test files
+      # leave mocks behind, so results depended on file order (which differs on Linux)
+      - run: bun test --isolate
 
   rust:
     name: Rust unit tests (macOS)
