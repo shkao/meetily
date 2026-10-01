@@ -7,6 +7,7 @@ import ReactMarkdown from 'react-markdown';
 import { AlertCircle, ArrowUpRight, Check, Copy, History, ListChecks, Loader2, Lock, RotateCcw, Send, Sparkles, TextQuote, Users, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
+import { toast } from 'sonner';
 
 interface Message {
   id: string;
@@ -27,8 +28,8 @@ const QUICK_PROMPTS: { text: string; icon: LucideIcon }[] = [
 ];
 
 // A bracketed group holding one or more mm:ss times: "[03:15]", "[00:39–02:24]", or the malformed "[07:24–[09:16]"
-const CITATION_GROUP = /\[([^\]\n]*?\d{1,2}:\d{2}[^\]\n]*?)\]/g;
-const TIME = /(\d{1,2}):(\d{2})/g;
+const CITATION_GROUP = /\[([^\]\n]*?\d{1,3}:\d{2}[^\]\n]*?)\]/g;
+const TIME = /(\d{1,3}):(\d{2})/g; // minutes can pass 99 in long meetings
 const TIME_LINK_PREFIX = '#t-';
 
 /** Turns cited times into markdown links that render as clickable time chips. */
@@ -60,17 +61,28 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
   }, [messages]);
 
+  // Focus once on open; the recording page re-renders several times a second
   useEffect(() => {
     inputRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+  }, []);
+
+  // Escape closes the panel only when focus is inside it, so closing another dialog doesn't wipe the chat
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (panelRef.current?.contains(document.activeElement)) onCloseRef.current();
+    };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -109,7 +121,9 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
       setMessages(prev => prev.map(m => (m.id === id ? { ...m, error: String(e) } : m)));
     } finally {
       setBusy(false);
-      inputRef.current?.focus();
+      // back to the question box, unless the user has moved on to something else meanwhile
+      const active = document.activeElement;
+      if (!active || active === document.body || panelRef.current?.contains(active)) inputRef.current?.focus();
     }
   };
 
@@ -126,7 +140,12 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
 
   const copy = async (m: Message) => {
     if (!m.answer) return;
-    await navigator.clipboard.writeText(m.answer);
+    try {
+      await navigator.clipboard.writeText(m.answer);
+    } catch {
+      toast.error('Could not copy the answer');
+      return;
+    }
     setCopiedId(m.id);
     setTimeout(() => setCopiedId(id => (id === m.id ? null : id)), 1500);
   };
@@ -191,7 +210,7 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
   const showFollowUps = last && !busy && (last.answer !== undefined || last.error);
 
   return (
-    <aside className="flex h-full w-[360px] flex-shrink-0 flex-col border-l border-gray-200 bg-white" aria-label="Ask AI">
+    <aside ref={panelRef} className="flex h-full w-[360px] flex-shrink-0 flex-col border-l border-gray-200 bg-white" aria-label="Ask AI">
       <header className="flex items-start justify-between border-b border-gray-200 px-4 py-3">
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-900">

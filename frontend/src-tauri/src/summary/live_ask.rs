@@ -51,29 +51,42 @@ fn system_prompt(with_speakers: bool) -> String {
 fn recent_window_secs(question: &str) -> Option<f64> {
     let words: Vec<String> = question
         .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric() && c != '.')
+        .map(|w| w.trim_matches('.').to_string())
         .filter(|w| !w.is_empty())
-        .map(String::from)
         .collect();
-    let at = words.iter().position(|w| w == "last" || w == "past")?;
-    let (count, unit) = match (words.get(at + 1), words.get(at + 2)) {
-        (Some(n), Some(unit)) if unit.starts_with("minute") || unit.starts_with("min") => (n.as_str(), "m"),
-        (Some(unit), _) if unit == "minute" => ("1", "m"),
-        (Some(n), Some(unit)) if unit.starts_with("second") => (n.as_str(), "s"),
-        _ => return None,
+    let unit_secs = |unit: &str| match unit {
+        "minute" | "minutes" | "min" | "mins" => Some(60.0),
+        "second" | "seconds" | "sec" | "secs" => Some(1.0),
+        _ => None,
     };
-    let n: f64 = match count {
-        "one" | "a" => 1.0,
-        "two" | "couple" => 2.0,
-        "three" | "few" => 3.0,
-        "four" => 4.0,
-        "five" => 5.0,
-        "ten" => 10.0,
-        "fifteen" => 15.0,
-        "thirty" => 30.0,
-        n => n.parse().ok()?,
+    let count = |n: &str| -> Option<f64> {
+        match n {
+            "one" | "a" => Some(1.0),
+            "two" | "couple" => Some(2.0),
+            "three" | "few" => Some(3.0),
+            "four" => Some(4.0),
+            "five" => Some(5.0),
+            "ten" => Some(10.0),
+            "fifteen" => Some(15.0),
+            "thirty" => Some(30.0),
+            n => n.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0),
+        }
     };
-    Some(if unit == "m" { n * 60.0 } else { n })
+    for at in (0..words.len()).filter(|&i| words[i] == "last" || words[i] == "past") {
+        match (words.get(at + 1), words.get(at + 2)) {
+            // "the last 2 minutes", "past ninety seconds" (count, then a time unit)
+            (Some(n), Some(unit)) if unit_secs(unit).is_some() => {
+                if let Some(n) = count(n) {
+                    return Some(n * unit_secs(unit)?);
+                }
+            }
+            // "in the last minute?" only at the end, so "last minute changes" isn't a time window
+            (Some(unit), None) if unit == "minute" => return Some(60.0),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Indices of the lines inside the last `window` seconds of the transcript.
@@ -248,6 +261,9 @@ async fn answer(
                 .map(|&i| LiveLine { start: lines[i].start, end: lines[i].end, text: lines[i].text.clone() })
                 .collect();
             let speakers: Vec<Option<usize>> = keep.iter().map(|&i| speakers.get(i).copied().flatten()).collect();
+            if lines.iter().all(|l| l.text.trim().is_empty()) {
+                return Ok("Nothing was transcribed in that time yet.".to_string());
+            }
             let note = format!("This is only the most recent part of the transcript, from {} on.\n", first);
             (lines, speakers, note)
         }
@@ -414,6 +430,14 @@ mod tests {
         assert_eq!(recent_window_secs("last few minutes please"), Some(180.0));
         assert_eq!(recent_window_secs("Summarize the discussion so far"), None);
         assert_eq!(recent_window_secs("What was the last decision?"), None);
+        assert_eq!(recent_window_secs("Any last minute changes?"), None);
+        assert_eq!(recent_window_secs("the last-minute changes"), None);
+        assert_eq!(recent_window_secs("the last two minor issues"), None);
+        assert_eq!(recent_window_secs("the last 2 mins"), Some(120.0));
+        assert_eq!(recent_window_secs("past 90 seconds"), Some(90.0));
+        assert_eq!(recent_window_secs("last 1.5 minutes"), Some(90.0));
+        assert_eq!(recent_window_secs("last time, what about the last 5 minutes?"), Some(300.0));
+        assert_eq!(recent_window_secs("last 0 minutes"), None);
     }
 
     #[test]
@@ -422,5 +446,13 @@ mod tests {
         let lines = vec![line(0.0, 10.0), line(50.0, 70.0), line(100.0, 115.0), line(170.0, 180.0)];
         assert_eq!(recent_line_indices(&lines, 120.0), vec![1, 2, 3]);
         assert_eq!(recent_line_indices(&lines, 30.0), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn window_question_without_recent_lines_says_so() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let untimed = vec![LiveLine { start: None, end: None, text: "hello".into() }];
+        let reply = answer(&pool, None, "What was discussed in the last two minutes?", &untimed, &[], &|_| {}).await;
+        assert_eq!(reply.unwrap(), "Nothing was transcribed in that time yet.");
     }
 }
