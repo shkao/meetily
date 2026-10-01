@@ -1,0 +1,42 @@
+name: CI frontend
+
+# TypeScript check and frontend tests, only on PRs that touch the frontend (about 20 s).
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - "!frontend/src-tauri/**"
+      - ".github/workflows/ci-frontend.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend (tsc + bun test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: oven-sh/setup-bun@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      # --isolate: Bun shares globals and module mocks across files by default, and several test files
+      # leave mocks behind, so results depended on file order (which differs on Linux)
+      - run: bun test --isolate

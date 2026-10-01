@@ -1,0 +1,38 @@
+name: CI rust
+
+# App unit tests on macOS (the primary platform; free for public repos), only on PRs that touch the
+# Rust app. About 5 min cold; later pushes to the same PR reuse the cache.
+on:
+  pull_request:
+    paths:
+      - "frontend/src-tauri/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci-rust.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust unit tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # tauri-build requires every externalBin to exist. No unit test runs the llama-helper sidecar,
+      # so a placeholder avoids building llama.cpp here. build.rs downloads ffmpeg itself.
+      - name: Placeholder llama-helper sidecar
+        run: |
+          mkdir -p frontend/src-tauri/binaries
+          touch frontend/src-tauri/binaries/llama-helper-aarch64-apple-darwin
+          chmod +x frontend/src-tauri/binaries/llama-helper-aarch64-apple-darwin
+      # test_builtin_mic_detection needs a real microphone (and fails upstream until #815)
+      - run: cargo test -p meetily --lib -- --skip test_builtin_mic_detection
