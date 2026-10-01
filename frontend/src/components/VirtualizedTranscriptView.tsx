@@ -191,6 +191,29 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         disableAutoScroll,
     });
 
+    // Ask AI citations jump here. Virtualized rows outside the viewport aren't rendered, so scroll by index first.
+    useEffect(() => {
+        const onJump = (event: Event) => {
+            const id = (event as CustomEvent<{ id: string }>).detail?.id;
+            const index = segments.findIndex(s => s.id === id);
+            if (index < 0) return;
+            const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if (segments.length >= VIRTUALIZATION_THRESHOLD) {
+                virtualizer.scrollToIndex(index, { align: 'center' });
+            }
+            // after the row renders: center it and flash it
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                const el = document.getElementById(`segment-${id}`);
+                if (!el) return;
+                el.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' });
+                el.classList.add('bg-yellow-100', 'rounded-md');
+                setTimeout(() => el.classList.remove('bg-yellow-100', 'rounded-md'), 1500);
+            }));
+        };
+        window.addEventListener('transcript-jump', onJump);
+        return () => window.removeEventListener('transcript-jump', onJump);
+    }, [segments, virtualizer]);
+
     // Streaming text effect hook (typewriter animation for new transcripts)
     const { streamingSegmentId, getDisplayText } = useTranscriptStreaming(
         segments,
@@ -430,3 +453,4 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         </div>
     );
 };
+
