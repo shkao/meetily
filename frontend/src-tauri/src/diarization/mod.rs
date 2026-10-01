@@ -97,18 +97,8 @@ pub async fn diarize_meeting(
         return Ok(false);
     }
 
-    let model_dir = ensure_model(&app_data_dir.join("models").join(MODEL_DIR), progress).await?;
-    progress("diarizing", None);
-    let pcm = decode_to_pcm(&audio).await?;
     let started = std::time::Instant::now();
-    let (probs, num_frames) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let mut source = PcmFile::open(&pcm)?;
-        let out = Diarizer::load(&model_dir)?.run(&mut source)?;
-        drop(pcm); // deletes the temp file
-        Ok(out)
-    })
-    .await??;
-    let labels = number_speakers(&label_segments(&probs, num_frames, &segments));
+    let (labels, audio_secs) = label_audio(app_data_dir, &audio, &segments, progress).await?;
 
     let mut tx = pool.begin().await?;
     for (seg, label) in segments.iter().zip(&labels) {
@@ -123,13 +113,66 @@ pub async fn diarize_meeting(
     info!(
         "Diarized {} ({:.0} s audio) in {:.1} s: {} of {} segments named, {} speakers",
         meeting_id,
-        (num_frames * HOP) as f64 / SR as f64,
+        audio_secs,
         started.elapsed().as_secs_f64(),
         labels.iter().filter(|l| l.is_some()).count(),
         labels.len(),
         labels.iter().flatten().max().map_or(0, |n| *n),
     );
     Ok(true)
+}
+
+/// Diarizes an audio file and returns, for each segment, its speaker number (1, 2, ... by first appearance) or None
+/// when silent, mixed or untimed, plus the audio length in seconds.
+async fn label_audio(
+    app_data_dir: &Path,
+    audio: &Path,
+    segments: &[Segment],
+    progress: &(dyn Fn(&str, Option<u32>) + Send + Sync),
+) -> Result<(Vec<Option<usize>>, f64)> {
+    let model_dir = ensure_model(&app_data_dir.join("models").join(MODEL_DIR), progress).await?;
+    progress("diarizing", None);
+    let pcm = decode_to_pcm(audio).await?;
+    let (probs, num_frames) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut source = PcmFile::open(&pcm)?;
+        let out = Diarizer::load(&model_dir)?.run(&mut source)?;
+        drop(pcm); // deletes the temp file
+        Ok(out)
+    })
+    .await??;
+    Ok((number_speakers(&label_segments(&probs, num_frames, segments)), (num_frames * HOP) as f64 / SR as f64))
+}
+
+/// Speaker numbers for the timed segments of a meeting still being recorded, from the audio recorded so far.
+/// Fails instead of waiting when another diarization is running. Segments past the recorded audio stay None.
+pub async fn label_live_segments(
+    app_data_dir: &Path,
+    meeting_folder: &Path,
+    spans: &[(Option<f64>, Option<f64>)],
+) -> Result<Vec<Option<usize>>> {
+    // Don't make a live question wait minutes behind the previous meeting's diarization
+    let _run = RUN_LOCK
+        .try_lock()
+        .map_err(|_| anyhow!("speaker identification is busy with a saved meeting"))?;
+    let joined = tempfile::Builder::new().prefix("meetily_live_").suffix(".aac").tempfile()?.into_temp_path();
+    let count = crate::audio::incremental_saver::join_recorded_audio(meeting_folder, &joined).map_err(|e| anyhow!(e))?;
+    if count == 0 {
+        bail!("No audio has been saved yet; try again in 30 seconds");
+    }
+    let segments: Vec<Segment> = spans
+        .iter()
+        .map(|&(start, end)| Segment { id: String::new(), start, end, timestamp: String::new(), text: String::new(), speaker: None })
+        .collect();
+    let started = std::time::Instant::now();
+    let (labels, audio_secs) = label_audio(app_data_dir, &joined, &segments, &|_, _| {}).await?;
+    info!(
+        "Diarized live meeting ({:.0} s audio) in {:.1} s: {} of {} segments named",
+        audio_secs,
+        started.elapsed().as_secs_f64(),
+        labels.iter().filter(|l| l.is_some()).count(),
+        labels.len()
+    );
+    Ok(labels)
 }
 
 /// Runs `diarize_meeting` for the app, one at a time, reporting progress as `diarization-progress` events.

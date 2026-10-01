@@ -287,14 +287,8 @@ pub async fn recover_audio_from_checkpoints(
     let adts = checkpoint_files.iter().all(|e| e.path().extension().and_then(|s| s.to_str()) == Some("aac"));
     let concat_file_path = if adts {
         let joined = checkpoints_dir.join("recovered_stream.aac");
-        let mut out = std::fs::File::create(&joined)
-            .map_err(|e| format!("Failed to create joined stream: {}", e))?;
-        for entry in &checkpoint_files {
-            let mut segment = std::fs::File::open(entry.path())
-                .map_err(|e| format!("Failed to open checkpoint: {}", e))?;
-            std::io::copy(&mut segment, &mut out)
-                .map_err(|e| format!("Failed to join checkpoints: {}", e))?;
-        }
+        let paths: Vec<PathBuf> = checkpoint_files.iter().map(|e| e.path()).collect();
+        write_joined_adts(&paths, &joined)?;
         command.args(&[
             "-i", joined.to_str().unwrap(),
             "-c", "copy",
@@ -412,6 +406,32 @@ pub async fn has_audio_checkpoints(meeting_folder: String) -> Result<bool, Strin
         .any(|entry| is_checkpoint_file(&entry.path()));
 
     Ok(has_mp4_files)
+}
+
+/// Joins ADTS checkpoint segments, in order, into one AAC stream at `out`.
+fn write_joined_adts(segments: &[PathBuf], out: &Path) -> Result<(), String> {
+    let mut joined = std::fs::File::create(out).map_err(|e| format!("Failed to create joined stream: {}", e))?;
+    for path in segments {
+        let mut segment = std::fs::File::open(path).map_err(|e| format!("Failed to open checkpoint: {}", e))?;
+        std::io::copy(&mut segment, &mut joined).map_err(|e| format!("Failed to join checkpoints: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Audio recorded so far in a meeting that is still recording, as one AAC stream at `out`, from the ADTS
+/// checkpoint segments. The newest segment may still be growing; its complete frames decode. Returns the
+/// number of segments joined (0 when none exist yet).
+pub(crate) fn join_recorded_audio(meeting_folder: &Path, out: &Path) -> Result<usize, String> {
+    let mut segments: Vec<PathBuf> = std::fs::read_dir(meeting_folder.join(".checkpoints"))
+        .map_err(|e| format!("Failed to read checkpoints directory: {}", e))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| is_checkpoint_file(path) && path.extension().and_then(|s| s.to_str()) == Some("aac"))
+        .collect();
+    segments.sort();
+    if !segments.is_empty() {
+        write_joined_adts(&segments, out)?;
+    }
+    Ok(segments.len())
 }
 
 /// Reads a child's stderr on a thread until it closes, keeping the last 64 KB for error messages. Without it, a
@@ -587,6 +607,21 @@ mod tests {
         let result = saver.finalize().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No audio checkpoints"));
+    }
+
+    #[test]
+    fn joins_recorded_segments_in_order_and_skips_other_files() {
+        let temp_dir = tempdir().unwrap();
+        let checkpoints = temp_dir.path().join(".checkpoints");
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        let out = temp_dir.path().join("joined.aac");
+        assert_eq!(join_recorded_audio(temp_dir.path(), &out).unwrap(), 0);
+
+        std::fs::write(checkpoints.join("audio_chunk_00001.aac"), b"BB").unwrap();
+        std::fs::write(checkpoints.join("audio_chunk_00000.aac"), b"AA").unwrap();
+        std::fs::write(checkpoints.join(PARTIAL_AUDIO_FILE), b"mp4").unwrap();
+        assert_eq!(join_recorded_audio(temp_dir.path(), &out).unwrap(), 2);
+        assert_eq!(std::fs::read(&out).unwrap(), b"AABB");
     }
 
     /// A child that writes more to stderr than a pipe holds must still finish once its stderr is drained. Before
