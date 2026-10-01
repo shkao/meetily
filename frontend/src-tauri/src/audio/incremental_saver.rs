@@ -165,7 +165,9 @@ impl IncrementalAudioSaver {
         let status = encoder.wait()?;
         let stderr_bytes = self.encoder_stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
         if let Some(e) = &self.encoder_error {
-            return Err(anyhow!("Audio encoding failed during recording: {}", e));
+            // ffmpeg's own message says why it stopped (disk full, output not writable...)
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            return Err(anyhow!("Audio encoding failed during recording: {} {}", e, stderr.trim()));
         }
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr_bytes);
@@ -420,10 +422,13 @@ fn drain_stderr(mut stderr: std::process::ChildStderr) -> std::thread::JoinHandl
         const KEEP: usize = 64 * 1024;
         let mut kept = Vec::new();
         let mut buf = [0u8; 8192];
-        while let Ok(n) = stderr.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
+        loop {
+            let n = match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
             kept.extend_from_slice(&buf[..n]);
             if kept.len() > KEEP {
                 kept.drain(..kept.len() - KEEP);
@@ -596,13 +601,25 @@ mod tests {
             .spawn()
             .unwrap();
         let drain = drain_stderr(child.stderr.take().unwrap());
+        // Write from a thread so a regression fails the deadline below instead of hanging the test
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(&[0u8; 100_000]).unwrap();
-        drop(stdin);
-        let started = std::time::Instant::now();
-        assert!(child.wait().unwrap().success());
+        let writer = std::thread::spawn(move || {
+            stdin.write_all(&[0u8; 100_000]).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("child blocked on a full stderr pipe");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        writer.join().unwrap();
+        assert!(status.success());
         let kept = drain.join().unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(kept.len(), 64 * 1024);
         assert!(kept.iter().all(|&b| b == b'x'));
     }
