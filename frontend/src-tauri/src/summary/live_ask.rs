@@ -34,9 +34,9 @@ example: \"Budget review moved to Friday [03:15]\". Never invent times.
 - If the transcript doesn't cover the question, say so. Don't guess.
 - Answer in the language of the question.";
 
-const NO_SPEAKERS_RULE: &str = "The transcript has no speaker names. If the question asks who said something or what \
-a named person said, say that speaker names aren't available during the meeting, then answer what you can without \
-attributing it.";
+const NO_SPEAKERS_RULE: &str = "The transcript has no speaker names. Mention that only when the question asks who \
+said something or what a named person said: then say that speaker names aren't available during the meeting and \
+answer what you can without attributing it.";
 
 const SPEAKERS_RULE: &str = "Some lines start with an anonymous label such as \"Speaker 2:\". The numbers tell \
 voices apart but not who they are; lines without a label have no reliable speaker. If the question names a person, \
@@ -44,6 +44,44 @@ say that speakers are only numbered during the meeting, then answer using the nu
 
 fn system_prompt(with_speakers: bool) -> String {
     SYSTEM_PROMPT_TEMPLATE.replace("{speakers}", if with_speakers { SPEAKERS_RULE } else { NO_SPEAKERS_RULE })
+}
+
+/// The time window a question asks about, in seconds, for questions like "what was discussed in the last two
+/// minutes". Small models can't do clock arithmetic on [mm:ss] times, so the lines are filtered before asking.
+fn recent_window_secs(question: &str) -> Option<f64> {
+    let words: Vec<String> = question
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect();
+    let at = words.iter().position(|w| w == "last" || w == "past")?;
+    let (count, unit) = match (words.get(at + 1), words.get(at + 2)) {
+        (Some(n), Some(unit)) if unit.starts_with("minute") || unit.starts_with("min") => (n.as_str(), "m"),
+        (Some(unit), _) if unit == "minute" => ("1", "m"),
+        (Some(n), Some(unit)) if unit.starts_with("second") => (n.as_str(), "s"),
+        _ => return None,
+    };
+    let n: f64 = match count {
+        "one" | "a" => 1.0,
+        "two" | "couple" => 2.0,
+        "three" | "few" => 3.0,
+        "four" => 4.0,
+        "five" => 5.0,
+        "ten" => 10.0,
+        "fifteen" => 15.0,
+        "thirty" => 30.0,
+        n => n.parse().ok()?,
+    };
+    Some(if unit == "m" { n * 60.0 } else { n })
+}
+
+/// Indices of the lines inside the last `window` seconds of the transcript.
+fn recent_line_indices(lines: &[LiveLine], window: f64) -> Vec<usize> {
+    let latest = lines.iter().filter_map(|l| l.end.or(l.start)).fold(0.0, f64::max);
+    (0..lines.len())
+        .filter(|&i| lines[i].end.or(lines[i].start).is_some_and(|t| t >= latest - window))
+        .collect()
 }
 
 /// Whether a question is about who said what, which needs speaker labels.
@@ -183,7 +221,26 @@ async fn answer(
     if question.is_empty() {
         return Err("Type a question first".to_string());
     }
-    let transcript = format_transcript(lines, speakers);
+    // "the last two minutes": keep only those lines, with their speaker labels
+    let (lines, speakers, note) = match recent_window_secs(question) {
+        Some(window) => {
+            let keep = recent_line_indices(lines, window);
+            let first = keep.first().and_then(|&i| lines[i].start).map(format_time).unwrap_or_default();
+            let lines: Vec<LiveLine> = keep
+                .iter()
+                .map(|&i| LiveLine { start: lines[i].start, end: lines[i].end, text: lines[i].text.clone() })
+                .collect();
+            let speakers: Vec<Option<usize>> = keep.iter().map(|&i| speakers.get(i).copied().flatten()).collect();
+            let note = format!("This is only the most recent part of the transcript, from {} on.\n", first);
+            (lines, speakers, note)
+        }
+        None => (
+            lines.iter().map(|l| LiveLine { start: l.start, end: l.end, text: l.text.clone() }).collect(),
+            speakers.to_vec(),
+            String::new(),
+        ),
+    };
+    let transcript = format!("{}{}", note, format_transcript(&lines, &speakers));
     let system = system_prompt(speakers.iter().any(|s| s.is_some()));
     if transcript.is_empty() {
         return Ok("Nothing has been transcribed yet.".to_string());
@@ -326,5 +383,23 @@ mod tests {
             );
             assert!(!reply.is_empty());
         }
+    }
+
+    #[test]
+    fn reads_recent_windows_from_questions() {
+        assert_eq!(recent_window_secs("What was discussed in the last two minutes?"), Some(120.0));
+        assert_eq!(recent_window_secs("summarize the past 5 min"), Some(300.0));
+        assert_eq!(recent_window_secs("What happened in the last minute?"), Some(60.0));
+        assert_eq!(recent_window_secs("last few minutes please"), Some(180.0));
+        assert_eq!(recent_window_secs("Summarize the discussion so far"), None);
+        assert_eq!(recent_window_secs("What was the last decision?"), None);
+    }
+
+    #[test]
+    fn keeps_lines_inside_the_recent_window() {
+        let line = |start: f64, end: f64| LiveLine { start: Some(start), end: Some(end), text: "x".into() };
+        let lines = vec![line(0.0, 10.0), line(50.0, 70.0), line(100.0, 115.0), line(170.0, 180.0)];
+        assert_eq!(recent_line_indices(&lines, 120.0), vec![1, 2, 3]);
+        assert_eq!(recent_line_indices(&lines, 30.0), vec![3]);
     }
 }

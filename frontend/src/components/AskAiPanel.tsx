@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Loader2, Send, Sparkles, X } from 'lucide-react';
+import { CornerDownRight, Loader2, Send, Sparkles, X } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 
 interface Message {
@@ -18,9 +18,10 @@ interface Message {
 }
 
 const QUICK_PROMPTS = [
-  'Catch me up',
   'Summarize the discussion so far',
-  'What are the key decisions and action items so far?',
+  'What was discussed in the last two minutes?',
+  'What decisions and action items came up?',
+  'What has each speaker said?',
 ];
 
 const TIME_PATTERN = /\[(\d{1,2}):(\d{2})\]/g;
@@ -166,15 +167,16 @@ export function AskAiPanel({ onClose }: AskAiPanelProps) {
       </div>
 
       <div className="border-t border-gray-200 p-3 space-y-2">
-        <div className="flex flex-wrap gap-1">
+        <div className="flex flex-col">
           {QUICK_PROMPTS.map(p => (
             <button
               key={p}
               type="button"
               disabled={busy}
               onClick={() => ask(p)}
-              className="text-xs px-2 py-1 rounded-full border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              className="flex items-center gap-2 px-1 py-1.5 text-left text-sm text-gray-700 rounded hover:bg-gray-50 disabled:opacity-50"
             >
+              <CornerDownRight className="w-4 h-4 flex-shrink-0 text-gray-400" />
               {p}
             </button>
           ))}
