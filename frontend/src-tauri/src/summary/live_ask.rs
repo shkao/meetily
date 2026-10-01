@@ -47,12 +47,26 @@ fn system_prompt(with_speakers: bool) -> String {
 }
 
 /// Whether a question is about who said what, which needs speaker labels.
+/// "Who...", "each speaker", or "did/does <someone> say/agree..." with a named subject; "what was said about X",
+/// "what did we say" and "in person" don't count, since diarizing costs seconds of CPU during the meeting.
 fn needs_speakers(question: &str) -> bool {
-    const WORDS: &[&str] = &["who", "whom", "whose", "said", "say", "says", "saying", "speaker", "speakers", "person"];
-    question
+    const WHO: &[&str] = &["who", "whom", "whose", "speaker", "speakers"];
+    const SUBJECTLESS: &[&str] = &["we", "i", "you", "they", "it", "anyone", "anybody", "someone", "somebody", "everyone", "people", "the", "this", "that"];
+    const VERBS: &[&str] = &["say", "said", "mention", "mentioned", "think", "suggest", "suggested", "propose", "agree", "disagree", "ask", "want", "decide", "promise", "commit"];
+    let words: Vec<String> = question
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .any(|word| WORDS.contains(&word))
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect();
+    if words.iter().any(|w| WHO.contains(&w.as_str())) {
+        return true;
+    }
+    words.windows(3).any(|w| {
+        matches!(w[0].as_str(), "did" | "does" | "do")
+            && !SUBJECTLESS.contains(&w[1].as_str())
+            && VERBS.contains(&w[2].as_str())
+    })
 }
 
 const NOTES_PROMPT: &str = "You read one part of a live meeting transcript. Each line starts with its time as \
@@ -160,7 +174,10 @@ pub async fn ask_ai_live<R: Runtime>(
             _ => Err("No recording in progress".to_string()),
         };
         match result {
-            Ok(labels) => speakers = labels,
+            Ok(labels) => {
+                speakers = labels;
+                status("Reading the transcript...");
+            }
             Err(e) => status(&format!("Couldn't identify speakers ({}); answering without them", e)),
         }
     }
@@ -264,10 +281,14 @@ mod tests {
 
     #[test]
     fn detects_questions_about_who_said_what() {
-        for q in ["What did Priya say about the budget?", "Who disagreed?", "What has each speaker said?", "Whose idea was it?"] {
+        for q in ["What did Priya say about the budget?", "Who disagreed?", "What has each speaker said?", "Whose idea was it?", "Did Priya agree?"] {
             assert!(needs_speakers(q), "{q}");
         }
-        for q in ["Catch me up", "What are the action items so far?", "Summarize the discussion so far", "Any wholesale changes?"] {
+        for q in [
+            "Catch me up", "What are the action items so far?", "Summarize the discussion so far", "Any wholesale changes?",
+            "What was said about the deadline?", "What did we say about hiring?", "Is the offsite in person?",
+            "What did they decide?",
+        ] {
             assert!(!needs_speakers(q), "{q}");
         }
     }

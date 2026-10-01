@@ -144,13 +144,16 @@ async fn label_audio(
 }
 
 /// Speaker numbers for the timed segments of a meeting still being recorded, from the audio recorded so far.
-/// Runs one at a time with other diarization. Segments past the recorded audio stay None.
+/// Fails instead of waiting when another diarization is running. Segments past the recorded audio stay None.
 pub async fn label_live_segments(
     app_data_dir: &Path,
     meeting_folder: &Path,
     spans: &[(Option<f64>, Option<f64>)],
 ) -> Result<Vec<Option<usize>>> {
-    let _run = RUN_LOCK.lock().await;
+    // Don't make a live question wait minutes behind the previous meeting's diarization
+    let _run = RUN_LOCK
+        .try_lock()
+        .map_err(|_| anyhow!("speaker identification is busy with a saved meeting"))?;
     let joined = tempfile::Builder::new().prefix("meetily_live_").suffix(".aac").tempfile()?.into_temp_path();
     let count = crate::audio::incremental_saver::join_recorded_audio(meeting_folder, &joined).map_err(|e| anyhow!(e))?;
     if count == 0 {
